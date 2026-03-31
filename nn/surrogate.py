@@ -1,7 +1,10 @@
-"""Surrogate-based optimizer — replaces the grid-search fsolve loop with NN inference.
+"""Surrogate-based optimizer -- replaces the grid-search fsolve loop with NN inference.
 
 Given a trained GateSurrogateNet, sweeps the full E-series grid in a single
 batched forward pass, then verifies top candidates with the real solver.
+
+Error is computed from V_out predictions vs target logic levels, NOT predicted
+by the NN directly. This gives much better ranking in the low-error region.
 """
 
 import time
@@ -23,7 +26,7 @@ class SurrogateOptimizer:
     Usage::
 
         opt = SurrogateOptimizer(model, board)
-        design = opt.optimize(GateType.NAND2, top_n_verify=20)
+        design = opt.optimize(GateType.NAND2, top_n_verify=50)
     """
 
     def __init__(self, model: GateSurrogateNet, board: BoardConfig,
@@ -40,16 +43,16 @@ class SurrogateOptimizer:
         r2_vals = e_series_values(series, r23_range[0], r23_range[1])
         r3_vals = e_series_values(series, r23_range[0], r23_range[1])
 
-        # Speed pre-filter
+        # Speed pre-filter: gate must settle within T / max_logic_depth
         cgd = self.board.caps.cgd0
         cgs = self.board.caps.cgs0
-        r_out_max = max_r_out_for_freq(self.board.f_target, cgd, cgs,
-                                        self.board.n_fanout)
-        max_hp = 1.0 / (2.0 * self.board.f_target)
+        max_delay = self.board.max_gate_delay
+        # R_out limit from 5*tau settling within max_delay
+        r_out_max = max_delay / (5.0 * self.board.n_fanout * (cgd + cgs))
 
         grid = []
         for r1 in r1_vals:
-            if 0.7 * r1 * (cgd + cgs) > max_hp:
+            if 0.7 * r1 * (cgd + cgs) > max_delay:
                 continue
             for r2 in r2_vals:
                 for r3 in r3_vals:
@@ -58,7 +61,7 @@ class SurrogateOptimizer:
                         continue
                     d = estimate_prop_delay(r1, r2, r3, cgd, cgs,
                                             self.board.n_fanout)
-                    if d > max_hp:
+                    if d > max_delay:
                         continue
                     grid.append((r1, r2, r3))
 
@@ -67,17 +70,15 @@ class SurrogateOptimizer:
     def predict_grid(self, grid: np.ndarray) -> np.ndarray:
         """Run the NN on a grid of (R1, R2, R3) values.
 
-        Returns (N, 4): V_out_high, V_out_low, avg_power, max_error
+        Returns (N, 3): V_out_high, V_out_low, avg_power
         """
         n = len(grid)
-        # Build full feature matrix: [R1, R2, R3, V+, V-, V_HIGH, V_LOW, temp]
-        X = np.empty((n, 8), dtype=np.float32)
+        # Build full feature matrix: [R1, R2, R3, V+, V-, temp]
+        X = np.empty((n, 6), dtype=np.float32)
         X[:, 0:3] = grid
         X[:, 3] = self.board.v_pos
         X[:, 4] = self.board.v_neg
-        X[:, 5] = self.board.v_high
-        X[:, 6] = self.board.v_low
-        X[:, 7] = self.board.temp_c
+        X[:, 5] = self.board.temp_c
 
         # Batched inference
         batch_size = 65536
@@ -91,13 +92,21 @@ class SurrogateOptimizer:
 
         return np.vstack(preds)
 
+    def _compute_error(self, preds: np.ndarray) -> np.ndarray:
+        """Compute max logic-level error from V_out predictions.
+
+        preds[:, 0] = predicted V_out_high (should match board.v_high)
+        preds[:, 1] = predicted V_out_low  (should match board.v_low)
+
+        Returns (N,) array of max absolute error in volts.
+        """
+        err_high = np.abs(preds[:, 0] - self.board.v_high)
+        err_low = np.abs(preds[:, 1] - self.board.v_low)
+        return np.maximum(err_high, err_low)
+
     def _verify_with_solver(self, gate_type: GateType,
                             candidates: np.ndarray) -> list:
-        """Run the real solver on candidate (R1, R2, R3) combos.
-
-        Returns list of (max_err, power, r1, r2, r3, v_high, v_low, delay)
-        matching the grid-search result format.
-        """
+        """Run the real solver on candidate (R1, R2, R3) combos."""
         table = truth_table(gate_type)
         v_map = {False: self.board.v_low, True: self.board.v_high}
         results = []
@@ -154,32 +163,17 @@ class SurrogateOptimizer:
                  r1_range: tuple = None,
                  r23_range: tuple = None,
                  max_error_tol: float = 0.2,
-                 top_n_verify: int = 20) -> GateDesign:
-        """Full optimization: NN sweep → verify top candidates → pick best.
+                 top_n_verify: int = 50) -> GateDesign:
+        """Full optimization: NN sweep -> verify top candidates -> pick best.
 
-        Parameters
-        ----------
-        gate_type : GateType
-        series : str
-            E-series for the grid ('E12', 'E24', 'E96').
-        r1_range, r23_range : tuple, optional
-            Override auto-computed resistance ranges.
-        max_error_tol : float
-            Max acceptable output error in volts.
-        top_n_verify : int
-            Number of top NN predictions to verify with real solver.
-
-        Returns
-        -------
-        GateDesign
+        Error is computed from V_out predictions vs target logic levels.
         """
         # Auto-compute R ranges from board constraints
         cgd = self.board.caps.cgd0
         cgs = self.board.caps.cgs0
-        r_out_max = max_r_out_for_freq(self.board.f_target, cgd, cgs,
-                                        self.board.n_fanout)
-        max_hp = 1.0 / (2.0 * self.board.f_target)
-        r1_max = max_hp / (10.0 * (cgd + cgs))
+        max_delay = self.board.max_gate_delay
+        r_out_max = max_delay / (5.0 * self.board.n_fanout * (cgd + cgs))
+        r1_max = max_delay / (0.7 * (cgd + cgs))
 
         if r1_range is None:
             r1_range = (100, min(r1_max, 500_000))
@@ -200,6 +194,9 @@ class SurrogateOptimizer:
                 v_pos=self.board.v_pos, v_neg=self.board.v_neg,
                 v_high=0, v_low=0, swing=0, power_mW=0,
                 delay_ns=0, max_error_mV=9999, converged=False,
+                f_target=self.board.f_target,
+                max_logic_depth=self.board.max_logic_depth,
+                temp_c=self.board.temp_c,
             )
 
         # Step 2: NN prediction
@@ -208,15 +205,14 @@ class SurrogateOptimizer:
         print(f"    NN inference: {t2-t1:.3f}s "
               f"({len(grid)/(t2-t1):.0f} combos/s)")
 
-        # Step 3: Rank by predicted error, take top candidates
-        pred_errors = preds[:, 3]  # max_error column
-        best_idx = np.argsort(pred_errors)[:top_n_verify]
+        # Step 3: Compute error from V_out predictions (NOT from NN output)
+        computed_errors = self._compute_error(preds)
+        best_idx = np.argsort(computed_errors)[:top_n_verify]
         top_grid = grid[best_idx]
-        top_preds = preds[best_idx]
 
-        print(f"    Top {top_n_verify} predicted errors: "
-              f"{pred_errors[best_idx[0]]*1e3:.1f}mV — "
-              f"{pred_errors[best_idx[-1]]*1e3:.1f}mV")
+        print(f"    Top {top_n_verify} computed errors: "
+              f"{computed_errors[best_idx[0]]*1e3:.1f}mV - "
+              f"{computed_errors[best_idx[-1]]*1e3:.1f}mV")
 
         # Step 4: Verify with real solver
         verified = self._verify_with_solver(gate_type, top_grid)
@@ -225,7 +221,6 @@ class SurrogateOptimizer:
               f"({t3-t2:.3f}s)")
 
         if not verified:
-            # Fall back: take NN's best guess unverified
             i = best_idx[0]
             r1, r2, r3 = float(grid[i, 0]), float(grid[i, 1]), float(grid[i, 2])
             return GateDesign(
@@ -234,8 +229,11 @@ class SurrogateOptimizer:
                 v_high=float(preds[i, 0]), v_low=float(preds[i, 1]),
                 swing=float(preds[i, 0] - preds[i, 1]),
                 power_mW=float(preds[i, 2] * 1e3),
-                delay_ns=0, max_error_mV=float(preds[i, 3] * 1e3),
+                delay_ns=0, max_error_mV=float(computed_errors[i] * 1e3),
                 converged=False,
+                f_target=self.board.f_target,
+                max_logic_depth=self.board.max_logic_depth,
+                temp_c=self.board.temp_c,
             )
 
         # Step 5: Among verified results within tolerance, pick lowest power
@@ -269,4 +267,7 @@ class SurrogateOptimizer:
             delay_ns=float(delay * 1e9),
             max_error_mV=float(max_err * 1e3),
             converged=bool(max_err <= max_error_tol),
+            f_target=self.board.f_target,
+            max_logic_depth=self.board.max_logic_depth,
+            temp_c=self.board.temp_c,
         )

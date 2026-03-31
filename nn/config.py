@@ -1,7 +1,6 @@
 """Configuration dataclasses for the NN surrogate pipeline."""
 
 from dataclasses import dataclass, field
-from pathlib import Path
 
 
 @dataclass
@@ -9,7 +8,7 @@ class SamplingConfig:
     """Controls training-data generation."""
 
     n_samples: int = 100_000
-    """Total number of (R1, R2, R3) sample points."""
+    """Total number of sample points."""
 
     r1_range: tuple = (100.0, 500_000.0)
     """Ohm range for R1 (pull-down resistor)."""
@@ -18,19 +17,22 @@ class SamplingConfig:
     """Ohm range for R2 and R3 (output divider)."""
 
     v_pos_range: tuple = None
-    """If set, sample V+ uniformly in this range; else use board default."""
+    """Sample V+ uniformly in this range. None = use board default (fixed)."""
 
     v_neg_range: tuple = None
-    """If set, sample V- uniformly in this range; else use board default."""
+    """Sample V- uniformly in this range. None = use board default (fixed)."""
 
     temp_range: tuple = None
-    """If set, sample temperature uniformly (°C); else use board default."""
+    """Sample temperature uniformly (C). None = use board default (fixed)."""
 
     log_r: bool = True
     """Sample resistor values in log-space (True) or linear (False)."""
 
     n_workers: int = 4
-    """Number of parallel worker processes for data generation."""
+    """Number of parallel worker processes for CPU data generation."""
+
+    use_gpu: bool = True
+    """Use GPU-accelerated solver for data generation (falls back to CPU if no CUDA)."""
 
     seed: int = 42
     """RNG seed for reproducibility."""
@@ -84,7 +86,7 @@ class PipelineConfig:
     model_dir: str = "nn/models"
     """Directory for saved model checkpoints."""
 
-    top_n_verify: int = 20
+    top_n_verify: int = 50
     """Number of top NN predictions to verify with the real solver."""
 
     e_series: str = "E96"

@@ -3,11 +3,20 @@
 A simple MLP that maps normalised circuit parameters to predicted outputs.
 Input normalisation (log-R, standardisation) is baked into the model so
 inference is a single ``model(raw_tensor)`` call with no external preprocessing.
+
+Inputs  (6): R1, R2, R3, V+, V-, temp
+Outputs (3): V_out_high, V_out_low, avg_power
 """
 
 import torch
 import torch.nn as nn
 import numpy as np
+
+N_INPUTS = 6    # R1, R2, R3, V+, V-, temp
+N_OUTPUTS = 3   # V_out_high, V_out_low, avg_power
+
+COLUMNS_X = ["R1", "R2", "R3", "V+", "V-", "temp"]
+COLUMNS_Y = ["V_out_high", "V_out_low", "avg_power"]
 
 
 class InputNormaliser(nn.Module):
@@ -65,14 +74,13 @@ class OutputDenormaliser(nn.Module):
 class GateSurrogateNet(nn.Module):
     """MLP surrogate for a single gate type.
 
-    Architecture:  InputNormaliser → [Linear → Act → (Dropout)] × N → Linear → OutputDenormaliser
-
-    Inputs  (8): R1, R2, R3, V+, V-, V_HIGH, V_LOW, temp
-    Outputs (4): V_out_high, V_out_low, avg_power, max_error
+    Architecture:  InputNormaliser -> [Linear -> Act -> (Dropout)] x N -> Linear -> OutputDenormaliser
     """
 
     def __init__(self, normaliser: InputNormaliser,
                  output_denorm: OutputDenormaliser = None,
+                 n_inputs: int = N_INPUTS,
+                 n_outputs: int = N_OUTPUTS,
                  hidden_dims: list = None,
                  activation: str = "silu",
                  dropout: float = 0.0):
@@ -92,26 +100,27 @@ class GateSurrogateNet(nn.Module):
         Act = act_map.get(activation, nn.SiLU)
 
         layers = []
-        in_dim = 8  # input features
+        in_dim = n_inputs
         for h in hidden_dims:
             layers.append(nn.Linear(in_dim, h))
             layers.append(Act())
             if dropout > 0:
                 layers.append(nn.Dropout(dropout))
             in_dim = h
-        layers.append(nn.Linear(in_dim, 4))  # 4 outputs
+        layers.append(nn.Linear(in_dim, n_outputs))
 
         self.trunk = nn.Sequential(*layers)
 
-        # Store metadata for serialisation
         self.meta = {
+            "n_inputs": n_inputs,
+            "n_outputs": n_outputs,
             "hidden_dims": hidden_dims,
             "activation": activation,
             "dropout": dropout,
         }
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass: raw inputs → denormalised predictions."""
+        """Forward pass: raw inputs -> denormalised predictions."""
         y_norm = self.trunk(self.normaliser(x))
         if self.output_denorm is not None:
             return self.output_denorm(y_norm)
@@ -122,7 +131,7 @@ class GateSurrogateNet(nn.Module):
         return self.trunk(self.normaliser(x))
 
     def predict_numpy(self, X: np.ndarray) -> np.ndarray:
-        """Convenience: numpy in → numpy out, no grad."""
+        """Convenience: numpy in -> numpy out, no grad."""
         self.eval()
         with torch.no_grad():
             x = torch.tensor(X, dtype=torch.float32, device=self._device())
@@ -155,12 +164,15 @@ class GateSurrogateNet(nn.Module):
         out_denorm = None
         if "out_mean" in ckpt:
             out_denorm = OutputDenormaliser(ckpt["out_mean"], ckpt["out_std"])
+        meta = ckpt["meta"]
         model = cls(
             normaliser=norm,
             output_denorm=out_denorm,
-            hidden_dims=ckpt["meta"]["hidden_dims"],
-            activation=ckpt["meta"]["activation"],
-            dropout=ckpt["meta"].get("dropout", 0.0),
+            n_inputs=meta.get("n_inputs", N_INPUTS),
+            n_outputs=meta.get("n_outputs", N_OUTPUTS),
+            hidden_dims=meta["hidden_dims"],
+            activation=meta["activation"],
+            dropout=meta.get("dropout", 0.0),
         )
         model.load_state_dict(ckpt["state_dict"])
         model.to(device)

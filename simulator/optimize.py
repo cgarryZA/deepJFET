@@ -33,6 +33,13 @@ class BoardConfig:
     temp_c: float = 27.0
     f_target: float = 100e3
     n_fanout: int = 4
+    max_logic_depth: int = 4
+    """Max series gates per clock cycle. Gate delay budget = T / max_logic_depth."""
+
+    @property
+    def max_gate_delay(self):
+        """Max propagation delay per gate in seconds."""
+        return 1.0 / (self.f_target * self.max_logic_depth)
 
     @property
     def v_threshold(self):
@@ -55,6 +62,9 @@ class GateDesign:
     delay_ns: float
     max_error_mV: float
     converged: bool
+    f_target: float = 0.0
+    max_logic_depth: int = 0
+    temp_c: float = 27.0
 
 
 def _evaluate_combo(gate_type, r1, r2, r3, board, use_db=True):

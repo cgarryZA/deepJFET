@@ -1,22 +1,21 @@
-"""Training data generation — sample R-space, solve with the real solver, build dataset.
+"""Training data generation -- sample R-space, solve with the real solver, build dataset.
 
 The heavy lifting happens in ``generate_dataset``:
-  1. Latin-Hypercube (or log-uniform) sample over (R1, R2, R3) and optionally
-     (V+, V-, temp).
-  2. For each sample, run ``_evaluate_combo`` from the existing optimizer to get
-     (V_out_high, V_out_low, avg_power, max_error).
+  1. Latin-Hypercube sample over (R1, R2, R3) and optionally (V+, V-, temp).
+  2. For each sample, run the solver to get (V_out_high, V_out_low, avg_power).
   3. Pack into NumPy arrays and save to disk.
 
-Parallelised with multiprocessing — each worker gets a slice of samples.
+Inputs  (6): R1, R2, R3, V+, V-, temp
+Outputs (3): V_out_high, V_out_low, avg_power
 """
 
-import os
 import time
 import numpy as np
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from .config import SamplingConfig
+from .model import COLUMNS_X, COLUMNS_Y
 
 
 # ---------------------------------------------------------------------------
@@ -32,21 +31,44 @@ def _latin_hypercube(n: int, dims: int, rng: np.random.Generator) -> np.ndarray:
     return result
 
 
-def _sample_r_values(cfg: SamplingConfig, rng: np.random.Generator) -> np.ndarray:
-    """Generate (n_samples, 3) array of R1, R2, R3 values."""
-    lhs = _latin_hypercube(cfg.n_samples, 3, rng)
+def _build_samples(cfg: SamplingConfig, board, rng: np.random.Generator) -> np.ndarray:
+    """Generate (n_samples, 6) array: R1, R2, R3, V+, V-, temp.
 
-    ranges = [cfg.r1_range, cfg.r23_range, cfg.r23_range]
-    result = np.empty_like(lhs)
+    R values are always sampled. V+, V-, temp are sampled if ranges are set,
+    otherwise use fixed board values.
+    """
+    n = cfg.n_samples
 
-    for col, (lo, hi) in enumerate(ranges):
-        if cfg.log_r:
+    # Determine how many dimensions to LHS over
+    varying = []  # (col_index, lo, hi, log_scale)
+    # R1, R2, R3 always vary
+    for col, rng_vals in [(0, cfg.r1_range), (1, cfg.r23_range), (2, cfg.r23_range)]:
+        varying.append((col, rng_vals[0], rng_vals[1], cfg.log_r))
+    # V+, V-, temp vary if ranges given
+    if cfg.v_pos_range is not None:
+        varying.append((3, cfg.v_pos_range[0], cfg.v_pos_range[1], False))
+    if cfg.v_neg_range is not None:
+        varying.append((4, cfg.v_neg_range[0], cfg.v_neg_range[1], False))
+    if cfg.temp_range is not None:
+        varying.append((5, cfg.temp_range[0], cfg.temp_range[1], False))
+
+    lhs = _latin_hypercube(n, len(varying), rng)
+
+    X = np.empty((n, 6), dtype=np.float64)
+    # Fill fixed values first
+    X[:, 3] = board.v_pos
+    X[:, 4] = board.v_neg
+    X[:, 5] = board.temp_c
+
+    # Fill varying columns from LHS
+    for i, (col, lo, hi, log_scale) in enumerate(varying):
+        if log_scale:
             log_lo, log_hi = np.log10(lo), np.log10(hi)
-            result[:, col] = 10.0 ** (log_lo + lhs[:, col] * (log_hi - log_lo))
+            X[:, col] = 10.0 ** (log_lo + lhs[:, i] * (log_hi - log_lo))
         else:
-            result[:, col] = lo + lhs[:, col] * (hi - lo)
+            X[:, col] = lo + lhs[:, i] * (hi - lo)
 
-    return result
+    return X
 
 
 # ---------------------------------------------------------------------------
@@ -54,8 +76,8 @@ def _sample_r_values(cfg: SamplingConfig, rng: np.random.Generator) -> np.ndarra
 # ---------------------------------------------------------------------------
 
 def _solve_chunk(args):
-    """Solve a chunk of R-combos.  Runs in a worker process."""
-    chunk_r, gate_type_str, board_dict = args
+    """Solve a chunk of samples. Runs in a worker process."""
+    chunk_x, gate_type_str, board_dict = args
 
     # Reconstruct objects inside the worker (can't pickle JFET/Board directly)
     from model import NChannelJFET, JFETCapacitance, GateType
@@ -65,43 +87,41 @@ def _solve_chunk(args):
 
     gate_type = GateType(gate_type_str)
 
-    jfet = NChannelJFET(**board_dict["jfet_params"]).at_temp(board_dict["temp_c"])
-    caps = JFETCapacitance(**board_dict["caps_params"])
-    board = BoardConfig(
-        v_high=board_dict["v_high"], v_low=board_dict["v_low"],
-        v_pos=board_dict["v_pos"], v_neg=board_dict["v_neg"],
-        jfet=jfet, caps=caps, temp_c=board_dict["temp_c"],
-        f_target=board_dict["f_target"], n_fanout=board_dict["n_fanout"],
-    )
+    # Outputs: v_out_high, v_out_low, avg_power, converged
+    outputs = []
 
-    table = truth_table(gate_type)
-    v_map = {False: board.v_low, True: board.v_high}
-
-    outputs = []  # (v_out_high, v_out_low, avg_power, max_error, converged)
-
-    for row in chunk_r:
+    for row in chunk_x:
         r1, r2, r3 = float(row[0]), float(row[1]), float(row[2])
-        max_err = 0.0
-        total_power = 0.0
+        v_pos, v_neg, temp_c = float(row[3]), float(row[4]), float(row[5])
+
+        # Reconstruct JFET at this temperature
+        jfet = NChannelJFET(**board_dict["jfet_params"]).at_temp(temp_c)
+        caps = JFETCapacitance(**board_dict["caps_params"])
+
+        # Determine logic levels from the board config
+        # (these are the target levels, used to define "all-off" and "all-on")
+        table = truth_table(gate_type)
+
         v_out_high = 0.0
         v_out_low = 0.0
+        total_power = 0.0
         ok = True
 
         try:
             for combo, out_high in table:
+                # Map boolean inputs to voltage levels
+                # Use board's v_high/v_low for input mapping
+                v_map = {False: board_dict["v_low"], True: board_dict["v_high"]}
                 v_ins = [v_map[b] for b in combo]
-                target = board.v_high if out_high else board.v_low
-                res = solve_any_gate(gate_type, v_ins,
-                                     board.v_pos, board.v_neg, r1, r2, r3,
-                                     board.jfet, board.jfet, board.temp_c)
 
-                err = abs(res["v_out"] - target)
-                max_err = max(max_err, err)
+                res = solve_any_gate(gate_type, v_ins,
+                                     v_pos, v_neg, r1, r2, r3,
+                                     jfet, jfet, temp_c)
 
                 i_r1 = res["i_r1_mA"] * 1e-3
                 i_j2 = res["i_j2_mA"] * 1e-3
                 i_load = res["i_load_mA"] * 1e-3
-                total_power += board.v_pos * (i_r1 + i_j2) + (-board.v_neg) * i_load
+                total_power += v_pos * (i_r1 + i_j2) + (-v_neg) * i_load
 
                 if all(not b for b in combo):
                     v_out_high = res["v_out"]
@@ -113,7 +133,7 @@ def _solve_chunk(args):
         n_states = len(table)
         avg_power = total_power / n_states if ok else 0.0
 
-        outputs.append((v_out_high, v_out_low, avg_power, max_err, 1.0 if ok else 0.0))
+        outputs.append((v_out_high, v_out_low, avg_power, 1.0 if ok else 0.0))
 
     return np.array(outputs)
 
@@ -153,20 +173,16 @@ def generate_dataset(gate_type, board, cfg: SamplingConfig = None,
     Parameters
     ----------
     gate_type : GateType
-        Which gate to generate data for.
     board : BoardConfig
-        Board-level configuration (rails, JFET, caps, temp, freq).
     cfg : SamplingConfig, optional
-        Sampling parameters.  Defaults to SamplingConfig().
     progress_cb : callable, optional
-        Called with (n_done, n_total) periodically.
 
     Returns
     -------
     dict with keys:
-        'X'       : (N, 8) float32 — input features
-        'Y'       : (N, 4) float32 — output targets
-        'mask'    : (N,)   bool    — True if solver converged
+        'X'       : (N, 6) float32 -- R1, R2, R3, V+, V-, temp
+        'Y'       : (N, 3) float32 -- V_out_high, V_out_low, avg_power
+        'mask'    : (N,)   bool    -- True if solver converged
         'columns_X' : list of str
         'columns_Y' : list of str
     """
@@ -174,35 +190,84 @@ def generate_dataset(gate_type, board, cfg: SamplingConfig = None,
         cfg = SamplingConfig()
 
     rng = np.random.default_rng(cfg.seed)
-    r_samples = _sample_r_values(cfg, rng)
+    X = _build_samples(cfg, board, rng)
 
-    # Build full input feature matrix:
-    # [R1, R2, R3, V+, V-, V_HIGH, V_LOW, temp]
     n = cfg.n_samples
-    X = np.empty((n, 8), dtype=np.float64)
-    X[:, 0:3] = r_samples
-    X[:, 3] = board.v_pos
-    X[:, 4] = board.v_neg
-    X[:, 5] = board.v_high
-    X[:, 6] = board.v_low
-    X[:, 7] = board.temp_c
-
     board_dict = _board_to_dict(board)
     gt_str = gate_type.value
 
     # Split into chunks for workers
     n_workers = min(cfg.n_workers, n)
-    chunks = np.array_split(r_samples, n_workers)
+    chunks = np.array_split(X, n_workers)
     args_list = [(chunk, gt_str, board_dict) for chunk in chunks]
 
     t0 = time.time()
+
+    # Try GPU backend first
+    _has_cuda = False
+    try:
+        import torch
+        _has_cuda = torch.cuda.is_available()
+    except ImportError:
+        pass
+
+    if cfg.use_gpu and _has_cuda:
+        try:
+            device = "cuda"
+            from .gpu_solver import gpu_solve_batch
+            print(f"  Generating {n:,} samples for {gt_str} "
+                  f"using GPU solver (device={device})...")
+
+            varying = ["R1", "R2", "R3"]
+            if cfg.v_pos_range is not None:
+                varying.append(f"V+=[{cfg.v_pos_range[0]:.0f},{cfg.v_pos_range[1]:.0f}]")
+            if cfg.v_neg_range is not None:
+                varying.append(f"V-=[{cfg.v_neg_range[0]:.0f},{cfg.v_neg_range[1]:.0f}]")
+            if cfg.temp_range is not None:
+                varying.append(f"T=[{cfg.temp_range[0]:.0f},{cfg.temp_range[1]:.0f}]C")
+            print(f"    Varying: {', '.join(varying)}")
+
+            Y_raw = gpu_solve_batch(gt_str, X, board_dict, device=device)
+
+            elapsed = time.time() - t0
+            Y = Y_raw[:, :3].astype(np.float32)
+            mask = Y_raw[:, 3].astype(bool)
+            converged_pct = mask.sum() / n * 100
+            print(f"  Done in {elapsed:.1f}s "
+                  f"({n/elapsed:.0f} samples/s, GPU)")
+            print(f"  Converged: {mask.sum():,}/{n:,} ({converged_pct:.1f}%)")
+
+            return {
+                "X": X[:, :6].astype(np.float32),
+                "Y": Y,
+                "mask": mask,
+                "columns_X": list(COLUMNS_X),
+                "columns_Y": list(COLUMNS_Y),
+            }
+        except Exception as e:
+            print(f"  GPU solver failed ({e}), falling back to CPU...")
+
+    # CPU fallback
+    n_workers = min(cfg.n_workers, n)
+    chunks = np.array_split(X, n_workers)
+    args_list = [(chunk, gt_str, board_dict) for chunk in chunks]
+
     print(f"  Generating {n:,} samples for {gt_str} "
-          f"using {n_workers} workers...")
+          f"using {n_workers} CPU workers...")
+
+    # Report which dimensions are varying
+    varying = ["R1", "R2", "R3"]
+    if cfg.v_pos_range is not None:
+        varying.append(f"V+=[{cfg.v_pos_range[0]:.0f},{cfg.v_pos_range[1]:.0f}]")
+    if cfg.v_neg_range is not None:
+        varying.append(f"V-=[{cfg.v_neg_range[0]:.0f},{cfg.v_neg_range[1]:.0f}]")
+    if cfg.temp_range is not None:
+        varying.append(f"T=[{cfg.temp_range[0]:.0f},{cfg.temp_range[1]:.0f}]C")
+    print(f"    Varying: {', '.join(varying)}")
 
     results_list = []
 
     if n_workers <= 1:
-        # Single-process (easier to debug)
         result = _solve_chunk(args_list[0])
         results_list.append(result)
     else:
@@ -224,24 +289,24 @@ def generate_dataset(gate_type, board, cfg: SamplingConfig = None,
                       f"rate={rate:.0f}/s  ETA={eta:.0f}s", end="\r")
             results_list = ordered
 
-    Y_raw = np.vstack(results_list)  # (N, 5): v_out_h, v_out_l, power, error, converged
+    Y_raw = np.vstack(results_list)  # (N, 4): v_out_h, v_out_l, power, converged
 
     elapsed = time.time() - t0
     print(f"\n  Done in {elapsed:.1f}s "
           f"({n/elapsed:.0f} samples/s)")
 
-    Y = Y_raw[:, :4].astype(np.float32)  # v_out_h, v_out_l, power, error
-    mask = Y_raw[:, 4].astype(bool)
+    Y = Y_raw[:, :3].astype(np.float32)  # v_out_h, v_out_l, power
+    mask = Y_raw[:, 3].astype(bool)
 
     converged_pct = mask.sum() / n * 100
     print(f"  Converged: {mask.sum():,}/{n:,} ({converged_pct:.1f}%)")
 
     return {
-        "X": X.astype(np.float32),
+        "X": X[:, :6].astype(np.float32),  # R1, R2, R3, V+, V-, temp
         "Y": Y,
         "mask": mask,
-        "columns_X": ["R1", "R2", "R3", "V+", "V-", "V_HIGH", "V_LOW", "temp"],
-        "columns_Y": ["V_out_high", "V_out_low", "avg_power", "max_error"],
+        "columns_X": list(COLUMNS_X),
+        "columns_Y": list(COLUMNS_Y),
     }
 
 

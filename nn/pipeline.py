@@ -1,4 +1,4 @@
-"""End-to-end pipeline: generate data → train → optimize → verify.
+"""End-to-end pipeline: generate data -> train -> optimize -> verify.
 
 Usage::
 
@@ -20,12 +20,13 @@ from .config import PipelineConfig
 from .data import generate_dataset, save_dataset, load_dataset
 from .train import train_surrogate, load_surrogate
 from .surrogate import SurrogateOptimizer
+from .registry import find_model, register_model, jfet_hash
 
 
 class SurrogateGatePipeline:
-    """One-click pipeline: new gate → data → train → optimise.
+    """One-click pipeline: new gate -> data -> train -> optimise.
 
-    Each step checks for cached results (dataset on disk, saved model)
+    Each step checks for cached results (dataset on disk, model registry)
     so re-runs skip completed work.
     """
 
@@ -36,10 +37,12 @@ class SurrogateGatePipeline:
         self._models = {}
 
     def _data_path(self, gate_type: GateType) -> str:
-        return str(Path(self.cfg.data_dir) / f"{gate_type.value}.npz")
+        jh = jfet_hash(self.board.jfet)
+        return str(Path(self.cfg.data_dir) / f"{gate_type.value}_{jh}.npz")
 
     def _model_path(self, gate_type: GateType) -> str:
-        return str(Path(self.cfg.model_dir) / f"{gate_type.value}.pt")
+        jh = jfet_hash(self.board.jfet)
+        return str(Path(self.cfg.model_dir) / f"{gate_type.value}_{jh}.pt")
 
     # ----- Step 1: Generate data -----
 
@@ -62,9 +65,21 @@ class SurrogateGatePipeline:
 
     def train(self, gate_type: GateType, dataset: dict = None,
               force: bool = False):
-        """Train the surrogate (or load from cache)."""
-        path = self._model_path(gate_type)
+        """Train the surrogate (or load from registry/cache)."""
+        # Check registry first
+        if not force:
+            entry = find_model(self.cfg.model_dir, gate_type,
+                               self.board.jfet, self.board)
+            if entry is not None:
+                model_path = entry["model_path"]
+                if Path(model_path).exists():
+                    print(f"[2/3] Loading registered model: {model_path}")
+                    model = load_surrogate(model_path)
+                    self._models[gate_type] = model
+                    return model
 
+        # Fallback to file path check
+        path = self._model_path(gate_type)
         if not force and Path(path).exists():
             print(f"[2/3] Loading cached model: {path}")
             model = load_surrogate(path)
@@ -79,6 +94,18 @@ class SurrogateGatePipeline:
             dataset, self.cfg.training, save_path=path,
         )
         self._models[gate_type] = model
+
+        # Register the model
+        best_mae = min(history["val_mae"]) if history["val_mae"] else None
+        register_model(
+            self.cfg.model_dir,
+            gate_type,
+            self.board.jfet,
+            path,
+            sampling_cfg=self.cfg.sampling,
+            metrics={"val_mae": best_mae},
+        )
+
         return model
 
     # ----- Step 3: Optimize -----
@@ -106,20 +133,7 @@ class SurrogateGatePipeline:
 
     def run(self, gate_type: GateType, force_data: bool = False,
             force_train: bool = False) -> GateDesign:
-        """Full pipeline: generate → train → optimize.
-
-        Parameters
-        ----------
-        gate_type : GateType
-        force_data : bool
-            Regenerate training data even if cached.
-        force_train : bool
-            Retrain model even if cached.
-
-        Returns
-        -------
-        GateDesign — optimized resistor values with verified outputs.
-        """
+        """Full pipeline: generate -> train -> optimize."""
         t0 = time.time()
         print(f"\n{'='*60}")
         print(f"Pipeline: {gate_type.value}")
@@ -127,8 +141,11 @@ class SurrogateGatePipeline:
               f"V-={self.board.v_neg:.0f}V  "
               f"V_HIGH={self.board.v_high:.2f}V  "
               f"V_LOW={self.board.v_low:.2f}V")
+        max_delay_ns = self.board.max_gate_delay * 1e9
         print(f"  f={self.board.f_target/1e3:.0f}kHz  "
-              f"T={self.board.temp_c:.0f}°C  "
+              f"depth={self.board.max_logic_depth}  "
+              f"budget={max_delay_ns:.0f}ns/gate  "
+              f"T={self.board.temp_c:.0f}C  "
               f"fanout={self.board.n_fanout}")
         print(f"{'='*60}")
 

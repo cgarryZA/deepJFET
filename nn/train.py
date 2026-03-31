@@ -11,7 +11,7 @@ from torch.utils.data import TensorDataset, DataLoader
 from pathlib import Path
 
 from .config import TrainConfig
-from .model import GateSurrogateNet, InputNormaliser, OutputDenormaliser
+from .model import GateSurrogateNet, InputNormaliser, OutputDenormaliser, N_OUTPUTS
 
 
 def train_surrogate(
@@ -25,17 +25,14 @@ def train_surrogate(
     Parameters
     ----------
     dataset : dict
-        From ``generate_dataset`` — has keys X, Y, mask.
+        From ``generate_dataset`` -- has keys X, Y, mask.
     cfg : TrainConfig
-        Training hyperparameters.
     save_path : str, optional
-        Where to save the best checkpoint.
     device : str, optional
-        'cuda', 'cpu', or None for auto-detect.
 
     Returns
     -------
-    (model, history) where history is a dict of per-epoch metrics.
+    (model, history)
     """
     if cfg is None:
         cfg = TrainConfig()
@@ -50,7 +47,10 @@ def train_surrogate(
     X = dataset["X"][dataset["mask"]]
     Y = dataset["Y"][dataset["mask"]]
     n_total = len(X)
-    print(f"  Training on {n_total:,} converged samples (device={device})")
+    n_inputs = X.shape[1]
+    n_outputs = Y.shape[1]
+    print(f"  Training on {n_total:,} converged samples "
+          f"({n_inputs} inputs -> {n_outputs} outputs, device={device})")
 
     # --- Train/val split ---
     n_val = int(n_total * cfg.val_fraction)
@@ -74,14 +74,16 @@ def train_surrogate(
     model = GateSurrogateNet(
         normaliser=normaliser,
         output_denorm=output_denorm,
+        n_inputs=n_inputs,
+        n_outputs=n_outputs,
         hidden_dims=cfg.hidden_dims,
         activation=cfg.activation,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"  Model: {cfg.hidden_dims} → {n_params:,} params")
+    print(f"  Model: {cfg.hidden_dims} -> {n_params:,} params")
 
-    # --- Data loaders (using normalised Y for training) ---
+    # --- Data loaders ---
     train_ds = TensorDataset(
         torch.tensor(X_train, dtype=torch.float32),
         torch.tensor(Y_train_norm, dtype=torch.float32),
@@ -118,7 +120,6 @@ def train_surrogate(
     t0 = time.time()
 
     for epoch in range(1, cfg.max_epochs + 1):
-        # Train (on normalised outputs)
         model.train()
         train_loss_sum = 0.0
         for xb, yb in train_dl:
@@ -131,7 +132,6 @@ def train_surrogate(
             train_loss_sum += loss.item() * len(xb)
         train_loss = train_loss_sum / n_train
 
-        # Validate (report denormalised MAE for interpretability)
         model.eval()
         val_loss_sum = 0.0
         val_mae_sum = 0.0
@@ -140,12 +140,11 @@ def train_surrogate(
                 xb, yb = xb.to(device), yb.to(device)
                 pred_norm = model.forward_normalised(xb)
                 val_loss_sum += criterion(pred_norm, yb).item() * len(xb)
-                # Denormalise for MAE in real units
                 pred_real = model.output_denorm(pred_norm)
                 yb_real = model.output_denorm(yb)
                 val_mae_sum += (pred_real - yb_real).abs().sum().item()
         val_loss = val_loss_sum / n_val
-        val_mae = val_mae_sum / (n_val * 4)  # 4 outputs, in real units
+        val_mae = val_mae_sum / (n_val * n_outputs)
 
         current_lr = opt.param_groups[0]["lr"]
         history["train_loss"].append(train_loss)
@@ -153,13 +152,11 @@ def train_surrogate(
         history["val_mae"].append(val_mae)
         history["lr"].append(current_lr)
 
-        # Scheduler step
         if cfg.scheduler == "plateau" and sched:
             sched.step(val_loss)
         elif sched:
             sched.step()
 
-        # Early stopping
         if val_loss < best_val:
             best_val = val_loss
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
@@ -180,7 +177,6 @@ def train_surrogate(
                   f"(no improvement for {cfg.patience} epochs)")
             break
 
-    # Restore best
     if best_state:
         model.load_state_dict(best_state)
     model.eval()
@@ -189,7 +185,6 @@ def train_surrogate(
     print(f"  Training complete in {elapsed:.1f}s  "
           f"best_val_loss={best_val:.6f}")
 
-    # Save
     if save_path:
         Path(save_path).parent.mkdir(parents=True, exist_ok=True)
         model.save(save_path)
