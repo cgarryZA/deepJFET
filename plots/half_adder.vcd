@@ -1,0 +1,41 @@
+$date
+  deepJFET simulation
+$end
+$timescale 1ns $end
+$scope module top $end
+$var wire 1 ! a $end
+$var wire 1 " b $end
+$var wire 1 # sum $end
+$var wire 1 $ carry $end
+$upscope $end
+$enddefinitions $end
+#0
+$dumpvars
+1!
+1"
+1#
+0$
+$end
+#10000
+1!
+#12366
+1#
+0$
+#15000
+1"
+#17366
+1$
+#18548
+0#
+#20000
+0!
+#22366
+0$
+#23548
+1#
+#30000
+1!
+#32366
+1$
+#33549
+0#
