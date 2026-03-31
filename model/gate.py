@@ -76,7 +76,7 @@ def solve_gate(
 
     best = None
     for guess in [(5.0, 3.0), (v_pos / 2.0, 0.0), (1.0, -1.0)]:
-        sol, info, ier, msg = fsolve(equations, guess, full_output=True)
+        sol, info, ier, msg = fsolve(equations, guess, full_output=True, maxfev=100)
         if ier == 1:
             best = sol
             break
@@ -150,7 +150,7 @@ def solve_nor(
 
     best = None
     for guess in [(5.0, 3.0), (v_pos / 2.0, 0.0), (1.0, -1.0)]:
-        sol, info, ier, msg = fsolve(equations, guess, full_output=True)
+        sol, info, ier, msg = fsolve(equations, guess, full_output=True, maxfev=100)
         if ier == 1:
             best = sol
             break
@@ -236,7 +236,7 @@ def solve_nand(
     for v_a_g, v_b_g in [(5.0, 3.0), (v_pos / 2.0, 0.0), (1.0, -1.0), (10.0, 5.0)]:
         mids_g = [v_a_g * (n_mids - k) / n for k in range(n_mids)]
         guess = [v_a_g, v_b_g] + mids_g
-        sol, info, ier, msg = fsolve(equations, guess, full_output=True)
+        sol, info, ier, msg = fsolve(equations, guess, full_output=True, maxfev=200)
         if ier == 1:
             best = sol
             break
