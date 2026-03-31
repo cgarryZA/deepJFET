@@ -1,0 +1,6 @@
+__pycache__/
+nn/data/
+nn/models/
+*.db
+*.db-shm
+*.db-wal
