@@ -37,18 +37,22 @@ class SurrogateOptimizer:
         self.model.to(self.device)
         self.model.eval()
 
-    def _build_grid(self, series: str, r1_range: tuple, r23_range: tuple):
+    def _build_grid(self, series: str, r1_range: tuple, r23_range: tuple,
+                    apply_speed_filter: bool = True):
         """Build the full E-series grid as a numpy array."""
         r1_vals = e_series_values(series, r1_range[0], r1_range[1])
         r2_vals = e_series_values(series, r23_range[0], r23_range[1])
         r3_vals = e_series_values(series, r23_range[0], r23_range[1])
 
-        # Speed pre-filter: gate must settle within T / max_logic_depth
         cgd = self.board.caps.cgd0
         cgs = self.board.caps.cgs0
-        max_delay = self.board.max_gate_delay
-        # R_out limit from 5*tau settling within max_delay
-        r_out_max = max_delay / (5.0 * self.board.n_fanout * (cgd + cgs))
+
+        if apply_speed_filter:
+            max_delay = self.board.max_gate_delay
+            r_out_max = max_delay / (5.0 * self.board.n_fanout * (cgd + cgs))
+        else:
+            max_delay = float('inf')
+            r_out_max = float('inf')
 
         grid = []
         for r1 in r1_vals:
@@ -59,10 +63,11 @@ class SurrogateOptimizer:
                     r_out = (r2 * r3) / (r2 + r3)
                     if r_out > r_out_max:
                         continue
-                    d = estimate_prop_delay(r1, r2, r3, cgd, cgs,
-                                            self.board.n_fanout)
-                    if d > max_delay:
-                        continue
+                    if apply_speed_filter:
+                        d = estimate_prop_delay(r1, r2, r3, cgd, cgs,
+                                                self.board.n_fanout)
+                        if d > max_delay:
+                            continue
                     grid.append((r1, r2, r3))
 
         return np.array(grid, dtype=np.float32)
@@ -163,26 +168,40 @@ class SurrogateOptimizer:
                  r1_range: tuple = None,
                  r23_range: tuple = None,
                  max_error_tol: float = 0.2,
-                 top_n_verify: int = 50) -> GateDesign:
+                 top_n_verify: int = 50,
+                 mode: str = "min_power",
+                 max_power_mW: float = 100.0) -> GateDesign:
         """Full optimization: NN sweep -> verify top candidates -> pick best.
 
-        Error is computed from V_out predictions vs target logic levels.
+        Modes:
+            'min_power': minimize power subject to error < tol and delay < budget
+            'max_freq':  minimize delay subject to error < tol and power < max_power_mW
+                         (ignores f_target speed constraint, searches full R range)
         """
-        # Auto-compute R ranges from board constraints
         cgd = self.board.caps.cgd0
         cgs = self.board.caps.cgs0
-        max_delay = self.board.max_gate_delay
-        r_out_max = max_delay / (5.0 * self.board.n_fanout * (cgd + cgs))
-        r1_max = max_delay / (0.7 * (cgd + cgs))
 
-        if r1_range is None:
-            r1_range = (100, min(r1_max, 500_000))
-        if r23_range is None:
-            r23_range = (100, min(2 * r_out_max, 500_000))
+        if mode == "max_freq":
+            # No speed pre-filter — search full R range for fastest gate
+            if r1_range is None:
+                r1_range = (100, 500_000)
+            if r23_range is None:
+                r23_range = (100, 500_000)
+        else:
+            # Auto-compute R ranges from board timing constraints
+            max_delay = self.board.max_gate_delay
+            r_out_max = max_delay / (5.0 * self.board.n_fanout * (cgd + cgs))
+            r1_max = max_delay / (0.7 * (cgd + cgs))
+            if r1_range is None:
+                r1_range = (100, min(r1_max, 500_000))
+            if r23_range is None:
+                r23_range = (100, min(2 * r_out_max, 500_000))
 
         # Step 1: Build grid
         t0 = time.time()
-        grid = self._build_grid(series, r1_range, r23_range)
+        apply_filter = (mode != "max_freq")
+        grid = self._build_grid(series, r1_range, r23_range,
+                                apply_speed_filter=apply_filter)
         t1 = time.time()
         print(f"  {gate_type.value}: {series} grid = {len(grid):,} combos "
               f"({t1-t0:.2f}s)")
@@ -236,22 +255,52 @@ class SurrogateOptimizer:
                 temp_c=self.board.temp_c,
             )
 
-        # Step 5: Among verified results within tolerance, pick lowest power
+        # Step 5: Pick best result based on mode
         within_tol = [r for r in verified if r[0] <= max_error_tol]
-        if within_tol:
-            within_tol.sort(key=lambda x: x[1])  # sort by power
-            pick = within_tol[0]
-            print(f"    Best (min power within {max_error_tol*1e3:.0f}mV): "
-                  f"R1={pick[2]/1e3:.2f}k R2={pick[3]/1e3:.2f}k "
-                  f"R3={pick[4]/1e3:.2f}k "
-                  f"err={pick[0]*1e3:.1f}mV P={pick[1]*1e3:.2f}mW")
+
+        if mode == "max_freq":
+            # Among results within error tol AND power cap, pick lowest delay
+            power_cap = max_power_mW / 1e3  # convert to watts
+            feasible = [r for r in within_tol if r[1] <= power_cap]
+            if feasible:
+                feasible.sort(key=lambda x: x[7])  # sort by delay
+                pick = feasible[0]
+                max_f = 1.0 / (pick[7] * self.board.max_logic_depth) if pick[7] > 0 else 0
+                print(f"    Best (max freq, P<{max_power_mW:.0f}mW): "
+                      f"R1={pick[2]/1e3:.2f}k R2={pick[3]/1e3:.2f}k "
+                      f"R3={pick[4]/1e3:.2f}k "
+                      f"err={pick[0]*1e3:.1f}mV P={pick[1]*1e3:.2f}mW "
+                      f"delay={pick[7]*1e9:.0f}ns "
+                      f"max_f={max_f/1e3:.0f}kHz")
+            elif within_tol:
+                within_tol.sort(key=lambda x: x[7])  # sort by delay
+                pick = within_tol[0]
+                print(f"    Best (min delay, power uncapped): "
+                      f"R1={pick[2]/1e3:.2f}k R2={pick[3]/1e3:.2f}k "
+                      f"R3={pick[4]/1e3:.2f}k "
+                      f"err={pick[0]*1e3:.1f}mV P={pick[1]*1e3:.2f}mW "
+                      f"delay={pick[7]*1e9:.0f}ns")
+            else:
+                verified.sort(key=lambda x: x[7])
+                pick = verified[0]
+                print(f"    Best (closest, outside tol): "
+                      f"R1={pick[2]/1e3:.2f}k err={pick[0]*1e3:.1f}mV")
         else:
-            verified.sort(key=lambda x: x[0])  # sort by error
-            pick = verified[0]
-            print(f"    Best (closest, outside tol): "
-                  f"R1={pick[2]/1e3:.2f}k R2={pick[3]/1e3:.2f}k "
-                  f"R3={pick[4]/1e3:.2f}k "
-                  f"err={pick[0]*1e3:.1f}mV P={pick[1]*1e3:.2f}mW")
+            # min_power mode (original)
+            if within_tol:
+                within_tol.sort(key=lambda x: x[1])  # sort by power
+                pick = within_tol[0]
+                print(f"    Best (min power within {max_error_tol*1e3:.0f}mV): "
+                      f"R1={pick[2]/1e3:.2f}k R2={pick[3]/1e3:.2f}k "
+                      f"R3={pick[4]/1e3:.2f}k "
+                      f"err={pick[0]*1e3:.1f}mV P={pick[1]*1e3:.2f}mW")
+            else:
+                verified.sort(key=lambda x: x[0])  # sort by error
+                pick = verified[0]
+                print(f"    Best (closest, outside tol): "
+                      f"R1={pick[2]/1e3:.2f}k R2={pick[3]/1e3:.2f}k "
+                      f"R3={pick[4]/1e3:.2f}k "
+                      f"err={pick[0]*1e3:.1f}mV P={pick[1]*1e3:.2f}mW")
 
         max_err, power, r1, r2, r3, v_high, v_low, delay = pick
 

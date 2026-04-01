@@ -17,3 +17,5 @@ from .surrogate import SurrogateOptimizer
 from .pipeline import SurrogateGatePipeline
 from .registry import find_model, register_model, jfet_hash
 from .gpu_solver import gpu_solve_batch
+from .gpu_transient import generate_delay_dataset, save_delay_dataset, load_delay_dataset
+from .delay_model import train_delay_model, predict_delay
