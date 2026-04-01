@@ -60,7 +60,10 @@ def _delay_worker(args):
         ok = True
 
         try:
-            # --- Step LOW -> HIGH: measure output fall delay ---
+            import signal
+            n_eval = min(500, max(100, int(t_sim / dt_max)))
+
+            # --- Step LOW -> HIGH ---
             def make_step_up(t_s=t_settle):
                 def fn(t):
                     return v_low if t < t_s else v_high
@@ -73,14 +76,14 @@ def _delay_worker(args):
                 v_in_funcs=v_in_funcs_up, gate_type_enum=gt_enum,
                 n_fanout=n_fanout, temp_c=temp_c,
             )
-            n_eval = min(500, max(100, int(t_sim / dt_max)))
             t_eval = np.linspace(0, t_sim, n_eval)
             res_up = simulate(circuit_up, t_span=(0, t_sim),
-                              t_eval=t_eval, max_step=dt_max)
+                              t_eval=t_eval, max_step=dt_max,
+                              rtol=1e-4, atol=1e-7)  # relaxed tol for speed
             timing_up = measure_timing(res_up)
             t_pd_hl = timing_up.get("tpd_hl_ns") or 0.0
 
-            # --- Step HIGH -> LOW: measure output rise delay ---
+            # --- Step HIGH -> LOW ---
             def make_step_down(t_s=t_settle):
                 def fn(t):
                     return v_high if t < t_s else v_low
@@ -95,7 +98,8 @@ def _delay_worker(args):
             )
             t_eval2 = np.linspace(0, t_sim, n_eval)
             res_down = simulate(circuit_down, t_span=(0, t_sim),
-                                t_eval=t_eval2, max_step=dt_max)
+                                t_eval=t_eval2, max_step=dt_max,
+                                rtol=1e-4, atol=1e-7)
             timing_down = measure_timing(res_down)
             t_pd_lh = timing_down.get("tpd_lh_ns") or 0.0
 
