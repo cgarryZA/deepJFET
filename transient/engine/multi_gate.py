@@ -194,6 +194,10 @@ def multi_gate_ode(t: float, state: np.ndarray, circuit: MultiGateCircuit):
         for k, res in enumerate(mid_residuals):
             derivs[start + 3 + k] = res / c_mid
 
+    # Clamp derivatives to prevent NaN propagation
+    derivs = np.nan_to_num(derivs, nan=0.0, posinf=1e8, neginf=-1e8)
+    np.clip(derivs, -1e9, 1e9, out=derivs)
+
     return derivs
 
 

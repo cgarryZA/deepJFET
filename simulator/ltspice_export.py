@@ -210,7 +210,7 @@ def export_netlist_asc(
     lines.append(f"SYMATTR InstName V_VSS")
     lines.append(f"SYMATTR Value {v_neg}")
     lines.append(f"FLAG {sx} 208 VSS")
-    lines.append(f"FLAG {sx} 304 0")
+    lines.append(f"FLAG {sx} 288 0")
 
     if stimuli:
         stim_y = 496
