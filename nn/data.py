@@ -76,31 +76,36 @@ def _build_samples(cfg: SamplingConfig, board, rng: np.random.Generator) -> np.n
 # ---------------------------------------------------------------------------
 
 def _solve_chunk(args):
-    """Solve a chunk of samples. Runs in a worker process."""
-    chunk_x, gate_type_str, board_dict = args
+    """Solve a chunk of samples. Runs in a worker process.
 
-    # Reconstruct objects inside the worker (can't pickle JFET/Board directly)
+    Accepts either a gate_type_str ("INV", "NAND2") or a network_dict
+    (serialized PulldownNetwork) for arbitrary topologies.
+    """
+    chunk_x, gate_type_str, board_dict, network_dict = args
+
     from model import NChannelJFET, JFETCapacitance, GateType
-    from simulator.optimize import BoardConfig
-    from simulator.gate_models import truth_table
-    from model import solve_any_gate
+    from model import solve_any_gate, solve_network
+    from model.network import from_dict, network_truth_table, input_names
 
-    gate_type = GateType(gate_type_str)
+    # Determine topology
+    if network_dict is not None:
+        network = from_dict(network_dict)
+        table = network_truth_table(network)
+        names = input_names(network)
+        use_network = True
+    else:
+        gate_type = GateType(gate_type_str)
+        from simulator.gate_models import truth_table
+        table = truth_table(gate_type)
+        use_network = False
 
-    # Outputs: v_out_high, v_out_low, avg_power, converged
     outputs = []
 
     for row in chunk_x:
         r1, r2, r3 = float(row[0]), float(row[1]), float(row[2])
         v_pos, v_neg, temp_c = float(row[3]), float(row[4]), float(row[5])
 
-        # Reconstruct JFET at this temperature
         jfet = NChannelJFET(**board_dict["jfet_params"]).at_temp(temp_c)
-        caps = JFETCapacitance(**board_dict["caps_params"])
-
-        # Determine logic levels from the board config
-        # (these are the target levels, used to define "all-off" and "all-on")
-        table = truth_table(gate_type)
 
         v_out_high = 0.0
         v_out_low = 0.0
@@ -109,14 +114,18 @@ def _solve_chunk(args):
 
         try:
             for combo, out_high in table:
-                # Map boolean inputs to voltage levels
-                # Use board's v_high/v_low for input mapping
                 v_map = {False: board_dict["v_low"], True: board_dict["v_high"]}
-                v_ins = [v_map[b] for b in combo]
 
-                res = solve_any_gate(gate_type, v_ins,
-                                     v_pos, v_neg, r1, r2, r3,
-                                     jfet, jfet, temp_c)
+                if use_network:
+                    v_ins_dict = {names[i]: v_map[combo[i]] for i in range(len(names))}
+                    res = solve_network(network, v_ins_dict,
+                                        v_pos, v_neg, r1, r2, r3,
+                                        jfet, jfet, temp_c)
+                else:
+                    v_ins = [v_map[b] for b in combo]
+                    res = solve_any_gate(gate_type, v_ins,
+                                         v_pos, v_neg, r1, r2, r3,
+                                         jfet, jfet, temp_c)
 
                 i_r1 = res["i_r1_mA"] * 1e-3
                 i_j2 = res["i_j2_mA"] * 1e-3
@@ -132,7 +141,6 @@ def _solve_chunk(args):
 
         n_states = len(table)
         avg_power = total_power / n_states if ok else 0.0
-
         outputs.append((v_out_high, v_out_low, avg_power, 1.0 if ok else 0.0))
 
     return np.array(outputs)
@@ -166,26 +174,23 @@ def _board_to_dict(board) -> dict:
 # Public API
 # ---------------------------------------------------------------------------
 
-def generate_dataset(gate_type, board, cfg: SamplingConfig = None,
+def generate_dataset(gate_type_or_network, board, cfg: SamplingConfig = None,
                      progress_cb=None):
-    """Generate training data for a single gate type.
+    """Generate training data for a gate type or arbitrary network topology.
 
     Parameters
     ----------
-    gate_type : GateType
+    gate_type_or_network : GateType or PulldownNetwork
     board : BoardConfig
     cfg : SamplingConfig, optional
     progress_cb : callable, optional
 
     Returns
     -------
-    dict with keys:
-        'X'       : (N, 6) float32 -- R1, R2, R3, V+, V-, temp
-        'Y'       : (N, 3) float32 -- V_out_high, V_out_low, avg_power
-        'mask'    : (N,)   bool    -- True if solver converged
-        'columns_X' : list of str
-        'columns_Y' : list of str
+    dict with 'X', 'Y', 'mask', 'columns_X', 'columns_Y'
     """
+    from model.network import PulldownNetwork, to_dict, canonical_str
+
     if cfg is None:
         cfg = SamplingConfig()
 
@@ -194,12 +199,21 @@ def generate_dataset(gate_type, board, cfg: SamplingConfig = None,
 
     n = cfg.n_samples
     board_dict = _board_to_dict(board)
-    gt_str = gate_type.value
 
-    # Split into chunks for workers
+    # Determine if using network or gate type
+    if isinstance(gate_type_or_network, PulldownNetwork):
+        network = gate_type_or_network
+        gt_str = canonical_str(network)
+        network_dict = to_dict(network)
+    else:
+        gate_type = gate_type_or_network
+        gt_str = gate_type.value
+        network_dict = None
+        network = None
+
     n_workers = min(cfg.n_workers, n)
     chunks = np.array_split(X, n_workers)
-    args_list = [(chunk, gt_str, board_dict) for chunk in chunks]
+    args_list = [(chunk, gt_str, board_dict, network_dict) for chunk in chunks]
 
     t0 = time.time()
 
@@ -214,7 +228,6 @@ def generate_dataset(gate_type, board, cfg: SamplingConfig = None,
     if cfg.use_gpu and _has_cuda:
         try:
             device = "cuda"
-            from .gpu_solver import gpu_solve_batch
             print(f"  Generating {n:,} samples for {gt_str} "
                   f"using GPU solver (device={device})...")
 
@@ -227,7 +240,12 @@ def generate_dataset(gate_type, board, cfg: SamplingConfig = None,
                 varying.append(f"T=[{cfg.temp_range[0]:.0f},{cfg.temp_range[1]:.0f}]C")
             print(f"    Varying: {', '.join(varying)}")
 
-            Y_raw = gpu_solve_batch(gt_str, X, board_dict, device=device)
+            if network is not None:
+                from .gpu_solver import gpu_solve_network
+                Y_raw = gpu_solve_network(network, X, board_dict, device=device)
+            else:
+                from .gpu_solver import gpu_solve_batch
+                Y_raw = gpu_solve_batch(gt_str, X, board_dict, device=device)
 
             elapsed = time.time() - t0
             Y = Y_raw[:, :3].astype(np.float32)

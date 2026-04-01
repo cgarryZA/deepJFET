@@ -325,3 +325,72 @@ class SurrogateOptimizer:
             max_logic_depth=self.board.max_logic_depth,
             temp_c=self.board.temp_c,
         )
+
+    def optimize_network(self, network, **kwargs) -> GateDesign:
+        """Optimize using arbitrary PulldownNetwork topology.
+
+        Uses solve_network for verification instead of solve_any_gate.
+        Same interface as optimize() for all other parameters.
+        """
+        from model.network import (
+            network_truth_table, input_names, canonical_str,
+        )
+        from model import solve_network as cpu_solve_network
+
+        gate_type = GateType.CUSTOM
+        table = network_truth_table(network)
+        names = input_names(network)
+
+        # Override _verify_with_solver to use network
+        orig_verify = self._verify_with_solver
+
+        def _verify_network(gt, candidates, candidate_delays=None):
+            v_map = {False: self.board.v_low, True: self.board.v_high}
+            results = []
+            for idx, row in enumerate(candidates):
+                r1, r2, r3 = float(row[0]), float(row[1]), float(row[2])
+                max_err = 0.0
+                total_power = 0.0
+                v_out_high = None
+                v_out_low = None
+                ok = True
+                try:
+                    for combo, out_high in table:
+                        v_ins = {names[i]: v_map[combo[i]] for i in range(len(names))}
+                        target = self.board.v_high if out_high else self.board.v_low
+                        res = cpu_solve_network(
+                            network, v_ins, self.board.v_pos, self.board.v_neg,
+                            r1, r2, r3, self.board.jfet, self.board.jfet,
+                            self.board.temp_c)
+                        err = abs(res["v_out"] - target)
+                        max_err = max(max_err, err)
+                        i_r1 = res["i_r1_mA"] * 1e-3
+                        i_j2 = res["i_j2_mA"] * 1e-3
+                        i_load = res["i_load_mA"] * 1e-3
+                        total_power += (self.board.v_pos * (i_r1 + i_j2)
+                                        + (-self.board.v_neg) * i_load)
+                        if all(not b for b in combo):
+                            v_out_high = res["v_out"]
+                        if all(b for b in combo):
+                            v_out_low = res["v_out"]
+                except Exception:
+                    ok = False
+                if not ok:
+                    continue
+                avg_power = total_power / len(table)
+                delay_ns = 0.0
+                if candidate_delays is not None:
+                    delay_ns = float(max(candidate_delays[idx, 0],
+                                         candidate_delays[idx, 1]))
+                results.append((max_err, avg_power, r1, r2, r3,
+                                v_out_high, v_out_low, delay_ns))
+            return results
+
+        # Temporarily replace verify
+        self._verify_with_solver = _verify_network
+        try:
+            design = self.optimize(gate_type, **kwargs)
+        finally:
+            self._verify_with_solver = orig_verify
+
+        return design

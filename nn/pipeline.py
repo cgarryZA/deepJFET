@@ -1,17 +1,25 @@
 """End-to-end pipeline: generate data -> train -> optimize -> verify.
 
+Accepts either GateType enums or PulldownNetwork topologies.
+
 Usage::
 
-    from model import GateType, NChannelJFET, JFETCapacitance
-    from simulator.optimize import BoardConfig
+    from model import GateType, Leaf, Series, Parallel
     from nn import SurrogateGatePipeline, PipelineConfig
 
     board = BoardConfig(...)
     pipe = SurrogateGatePipeline(board)
-    design = pipe.run(GateType.NAND2)
+
+    # Standard gate types
+    pipe.run(GateType.INV)
+
+    # Arbitrary topology
+    net = Parallel((Leaf("A"), Series((Leaf("B"), Leaf("C")))))
+    pipe.run(net)
 """
 
 import time
+import hashlib
 from pathlib import Path
 
 from model import GateType
@@ -23,12 +31,21 @@ from .surrogate import SurrogateOptimizer
 from .registry import find_model, register_model, jfet_hash
 
 
-class SurrogateGatePipeline:
-    """One-click pipeline: new gate -> data -> train -> optimise.
+def _topo_key(gate_type_or_network) -> str:
+    """Get a string key for any gate type or network topology."""
+    from model.network import PulldownNetwork, canonical_str
+    if isinstance(gate_type_or_network, PulldownNetwork):
+        cs = canonical_str(gate_type_or_network)
+        # Hash long canonical strings for filesystem safety
+        if len(cs) > 30:
+            h = hashlib.md5(cs.encode()).hexdigest()[:8]
+            return f"net_{h}"
+        return cs.replace("(", "_").replace(")", "").replace(",", "_")
+    return gate_type_or_network.value
 
-    Each step checks for cached results (dataset on disk, model registry)
-    so re-runs skip completed work.
-    """
+
+class SurrogateGatePipeline:
+    """One-click pipeline for any gate topology."""
 
     def __init__(self, board: BoardConfig, cfg: PipelineConfig = None):
         self.board = board
@@ -36,107 +53,87 @@ class SurrogateGatePipeline:
         self.designs = {}
         self._models = {}
 
-    def _data_path(self, gate_type: GateType) -> str:
+    def _data_path(self, topo) -> str:
         jh = jfet_hash(self.board.jfet)
-        return str(Path(self.cfg.data_dir) / f"{gate_type.value}_{jh}.npz")
+        key = _topo_key(topo)
+        return str(Path(self.cfg.data_dir) / f"{key}_{jh}.npz")
 
-    def _model_path(self, gate_type: GateType) -> str:
+    def _model_path(self, topo) -> str:
         jh = jfet_hash(self.board.jfet)
-        return str(Path(self.cfg.model_dir) / f"{gate_type.value}_{jh}.pt")
+        key = _topo_key(topo)
+        return str(Path(self.cfg.model_dir) / f"{key}_{jh}.pt")
 
-    # ----- Step 1: Generate data -----
-
-    def generate(self, gate_type: GateType, force: bool = False) -> dict:
-        """Generate training data (or load from cache)."""
-        path = self._data_path(gate_type)
-
+    def generate(self, topo, force: bool = False) -> dict:
+        path = self._data_path(topo)
         if not force and Path(path).exists():
             print(f"[1/3] Loading cached dataset: {path}")
             return load_dataset(path)
 
-        print(f"[1/3] Generating training data for {gate_type.value}...")
-        dataset = generate_dataset(
-            gate_type, self.board, self.cfg.sampling,
-        )
+        key = _topo_key(topo)
+        print(f"[1/3] Generating training data for {key}...")
+        dataset = generate_dataset(topo, self.board, self.cfg.sampling)
         save_dataset(dataset, path)
         return dataset
 
-    # ----- Step 2: Train -----
+    def train(self, topo, dataset: dict = None, force: bool = False):
+        key = _topo_key(topo)
+        path = self._model_path(topo)
 
-    def train(self, gate_type: GateType, dataset: dict = None,
-              force: bool = False):
-        """Train the surrogate (or load from registry/cache)."""
-        # Check registry first
-        if not force:
-            entry = find_model(self.cfg.model_dir, gate_type,
-                               self.board.jfet, self.board)
-            if entry is not None:
-                model_path = entry["model_path"]
-                if Path(model_path).exists():
-                    print(f"[2/3] Loading registered model: {model_path}")
-                    model = load_surrogate(model_path)
-                    self._models[gate_type] = model
-                    return model
-
-        # Fallback to file path check
-        path = self._model_path(gate_type)
         if not force and Path(path).exists():
             print(f"[2/3] Loading cached model: {path}")
             model = load_surrogate(path)
-            self._models[gate_type] = model
+            self._models[key] = model
             return model
 
         if dataset is None:
-            dataset = self.generate(gate_type)
+            dataset = self.generate(topo)
 
-        print(f"[2/3] Training surrogate for {gate_type.value}...")
+        print(f"[2/3] Training surrogate for {key}...")
         model, history = train_surrogate(
             dataset, self.cfg.training, save_path=path,
         )
-        self._models[gate_type] = model
-
-        # Register the model
-        best_mae = min(history["val_mae"]) if history["val_mae"] else None
-        register_model(
-            self.cfg.model_dir,
-            gate_type,
-            self.board.jfet,
-            path,
-            sampling_cfg=self.cfg.sampling,
-            metrics={"val_mae": best_mae},
-        )
-
+        self._models[key] = model
         return model
 
-    # ----- Step 3: Optimize -----
-
-    def optimize(self, gate_type: GateType, model=None) -> GateDesign:
-        """Run surrogate-based optimization."""
+    def optimize(self, topo, model=None, **kwargs) -> GateDesign:
+        key = _topo_key(topo)
         if model is None:
-            model = self._models.get(gate_type)
+            model = self._models.get(key)
         if model is None:
-            model = self.train(gate_type)
+            model = self.train(topo)
 
-        print(f"[3/3] Optimizing {gate_type.value} with NN surrogate...")
+        print(f"[3/3] Optimizing {key} with NN surrogate...")
         optimizer = SurrogateOptimizer(model, self.board)
-        design = optimizer.optimize(
-            gate_type,
-            series=self.cfg.e_series,
-            r1_range=self.cfg.r1_range,
-            r23_range=self.cfg.r23_range,
-            top_n_verify=self.cfg.top_n_verify,
-        )
-        self.designs[gate_type] = design
+
+        # For verification, need gate_type for solve_any_gate or network for solve_network
+        from model.network import PulldownNetwork
+        if isinstance(topo, PulldownNetwork):
+            design = optimizer.optimize_network(
+                topo,
+                series=self.cfg.e_series,
+                r1_range=self.cfg.r1_range,
+                r23_range=self.cfg.r23_range,
+                top_n_verify=self.cfg.top_n_verify,
+                **kwargs,
+            )
+        else:
+            design = optimizer.optimize(
+                topo,
+                series=self.cfg.e_series,
+                r1_range=self.cfg.r1_range,
+                r23_range=self.cfg.r23_range,
+                top_n_verify=self.cfg.top_n_verify,
+                **kwargs,
+            )
+        self.designs[key] = design
         return design
 
-    # ----- All-in-one -----
-
-    def run(self, gate_type: GateType, force_data: bool = False,
-            force_train: bool = False) -> GateDesign:
-        """Full pipeline: generate -> train -> optimize."""
+    def run(self, topo, force_data: bool = False,
+            force_train: bool = False, **kwargs) -> GateDesign:
         t0 = time.time()
+        key = _topo_key(topo)
         print(f"\n{'='*60}")
-        print(f"Pipeline: {gate_type.value}")
+        print(f"Pipeline: {key}")
         print(f"  Board: V+={self.board.v_pos:.0f}V  "
               f"V-={self.board.v_neg:.0f}V  "
               f"V_HIGH={self.board.v_high:.2f}V  "
@@ -149,9 +146,9 @@ class SurrogateGatePipeline:
               f"fanout={self.board.n_fanout}")
         print(f"{'='*60}")
 
-        dataset = self.generate(gate_type, force=force_data)
-        model = self.train(gate_type, dataset, force=force_train)
-        design = self.optimize(gate_type, model)
+        dataset = self.generate(topo, force=force_data)
+        model = self.train(topo, dataset, force=force_train)
+        design = self.optimize(topo, model, **kwargs)
 
         elapsed = time.time() - t0
         print(f"\nPipeline complete in {elapsed:.1f}s")
@@ -166,18 +163,16 @@ class SurrogateGatePipeline:
 
         return design
 
-    def run_all(self, gate_types: list, **kwargs) -> dict:
-        """Run the pipeline for multiple gate types."""
-        for gt in gate_types:
-            self.run(gt, **kwargs)
+    def run_all(self, topos: list, **kwargs) -> dict:
+        for topo in topos:
+            self.run(topo, **kwargs)
 
-        # Summary table
         print(f"\n{'='*60}")
-        print(f"{'Type':<7} {'R1':>8} {'R2':>8} {'R3':>8} "
+        print(f"{'Type':<20} {'R1':>8} {'R2':>8} {'R3':>8} "
               f"{'V_H':>7} {'V_L':>7} {'Err':>8} {'Power':>8}")
-        print("-" * 70)
-        for gt, d in self.designs.items():
-            print(f"{gt.value:<7} "
+        print("-" * 75)
+        for key, d in self.designs.items():
+            print(f"{key:<20} "
                   f"{d.r1/1e3:>7.2f}k {d.r2/1e3:>7.2f}k "
                   f"{d.r3/1e3:>7.2f}k "
                   f"{d.v_high:>7.3f} {d.v_low:>7.3f} "
