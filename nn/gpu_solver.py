@@ -80,7 +80,134 @@ def _ids_j(vgs, vds, jp):
 
 
 # ---------------------------------------------------------------------------
-# Circuit residuals
+# Recursive network current (GPU tensors) — arbitrary topology
+# ---------------------------------------------------------------------------
+
+def _network_current_gpu(net, v_top, v_bot, v_inputs_dict, jp,
+                         midpoint_cols, mid_offset):
+    """Recursive J1 current computation on GPU tensors.
+
+    Args:
+        net: PulldownNetwork (Leaf/Series/Parallel)
+        v_top: (B,) top node voltage
+        v_bot: (B,) bottom node voltage
+        v_inputs_dict: dict of input_name -> (B,) tensor
+        jp: JFET params dict
+        midpoint_cols: (B, total_midpoints) tensor of midpoint voltages
+        mid_offset: [int] mutable counter, indexes into midpoint_cols
+
+    Returns:
+        (i_drain, igd_top, mid_residuals)
+        i_drain: (B,) current from top to bottom
+        igd_top: (B,) gate-drain current of topmost JFET
+        mid_residuals: list of (B,) KCL residuals at midpoints
+    """
+    from model.network import Leaf, Series, Parallel
+
+    if isinstance(net, Leaf):
+        vgs = v_inputs_dict[net.input_name] - v_bot
+        vds = v_top - v_bot
+        i_d = _ids_j(vgs, vds, jp)
+        # Gate junction current of this JFET
+        vgs_int = v_inputs_dict[net.input_name] - (v_bot + i_d * jp['rs'])
+        vgd_int = v_inputs_dict[net.input_name] - (v_top - i_d * jp['rd'])
+        _, igd = _gate_currents(vgs_int, vgd_int, jp['is_'], jp['n'],
+                                jp['isr'], jp['nr'],
+                                torch.zeros_like(v_top) + K_BOLTZ * 300.15 / Q_ELEC)
+        return i_d, igd, []
+
+    if isinstance(net, Parallel):
+        i_total = torch.zeros_like(v_top)
+        igd_total = torch.zeros_like(v_top)
+        all_residuals = []
+        for child in net.children:
+            i_k, igd_k, res_k = _network_current_gpu(
+                child, v_top, v_bot, v_inputs_dict, jp,
+                midpoint_cols, mid_offset)
+            i_total = i_total + i_k
+            igd_total = igd_total + igd_k
+            all_residuals.extend(res_k)
+        return i_total, igd_total, all_residuals
+
+    if isinstance(net, Series):
+        n = len(net.children)
+        # Build node voltages
+        nodes = [v_top]
+        for _ in range(n - 1):
+            idx = mid_offset[0]
+            mid_offset[0] += 1
+            nodes.append(midpoint_cols[:, idx])
+        nodes.append(v_bot)
+
+        # Current through each child (just drain current, no gate effects)
+        currents = []
+        all_residuals = []
+        for k, child in enumerate(net.children):
+            i_k, _, res_k = _network_current_gpu(
+                child, nodes[k], nodes[k + 1], v_inputs_dict, jp,
+                midpoint_cols, mid_offset)
+            currents.append(i_k)
+            all_residuals.extend(res_k)
+
+        # KCL at midpoints
+        for k in range(n - 1):
+            all_residuals.append(currents[k] - currents[k + 1])
+
+        # Gate current of topmost — use topmost leaf
+        i_top = currents[0]
+        top_leaf = _find_topmost_leaf(net)
+        vgs_int = v_inputs_dict[top_leaf.input_name] - (nodes[1] + i_top * jp['rs'])
+        vgd_int = v_inputs_dict[top_leaf.input_name] - (v_top - i_top * jp['rd'])
+        _, igd_top = _gate_currents(vgs_int, vgd_int, jp['is_'], jp['n'],
+                                     jp['isr'], jp['nr'],
+                                     torch.zeros_like(v_top) + K_BOLTZ * 300.15 / Q_ELEC)
+        return i_top, igd_top, all_residuals
+
+
+def _find_topmost_leaf(net):
+    from model.network import Leaf
+    if isinstance(net, Leaf):
+        return net
+    return _find_topmost_leaf(net.children[0])
+
+
+def _network_residuals_gpu(x, v_ins_dict, r1, r_load, v_pos, v_neg, vt, jp, network):
+    """KCL residuals for arbitrary topology. x:(B, n_vars). Returns (B, n_vars).
+
+    x columns: [v_a, v_b, mid_0, mid_1, ...]
+    """
+    from model.network import count_midpoints
+    B = x.shape[0]
+    v_a = x[:, 0]
+    v_b = x[:, 1]
+    n_mids = count_midpoints(network)
+
+    if n_mids > 0:
+        midpoint_cols = x[:, 2:2 + n_mids]
+    else:
+        midpoint_cols = torch.zeros(B, 0, device=x.device, dtype=x.dtype)
+
+    mid_offset = [0]
+    i_j1, igd_j1, mid_residuals = _network_current_gpu(
+        network, v_a, torch.zeros_like(v_a), v_ins_dict, jp,
+        midpoint_cols, mid_offset)
+
+    # J2 (same for all topologies)
+    i_j2 = _ids_j(v_a - v_b, v_pos - v_b, jp)
+    vgs2_int = v_a - (v_b + i_j2 * jp['rs'])
+    vgd2_int = v_a - (v_pos - i_j2 * jp['rd'])
+    igs_j2, igd_j2 = _gate_currents(vgs2_int, vgd2_int, jp['is_'], jp['n'],
+                                      jp['isr'], jp['nr'], vt)
+
+    eq_a = (v_pos - v_a) / r1 + igd_j1 - i_j1 - (igs_j2 + igd_j2)
+    eq_b = i_j2 + igs_j2 - (v_b - v_neg) / r_load
+
+    all_eqs = [eq_a, eq_b] + mid_residuals
+    return torch.stack(all_eqs, dim=1)
+
+
+# ---------------------------------------------------------------------------
+# Circuit residuals (legacy gate-type-specific, kept for backward compat)
 # ---------------------------------------------------------------------------
 
 def _inv_nor_residuals(x, v_ins, r1, r_load, v_pos, v_neg, vt, jp):
@@ -442,6 +569,171 @@ def gpu_solve_batch(gate_type_str: str, X: np.ndarray,
         v_out = v_neg + i_load * r3
 
         # Power
+        i_r1 = (v_pos - v_a) / r1
+        i_j2 = _ids_j(v_a - v_b, v_pos - v_b, jp)
+        total_power = total_power + v_pos * (i_r1 + i_j2) + (-v_neg) * i_load
+
+        if all(not b for b in combo):
+            v_out_high = v_out.clone()
+        if all(b for b in combo):
+            v_out_low = v_out.clone()
+
+    avg_power = total_power / n_tt
+
+    result = torch.stack([
+        v_out_high, v_out_low, avg_power,
+        all_converged.to(dt),
+    ], dim=1)
+
+    return result.cpu().numpy().astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Network-based GPU solver (arbitrary topology)
+# ---------------------------------------------------------------------------
+
+def gpu_solve_network(network, X: np.ndarray, board_dict: dict,
+                      device: str = None) -> np.ndarray:
+    """Solve circuits with arbitrary pull-down topology on GPU.
+
+    Args:
+        network: PulldownNetwork (Leaf/Series/Parallel)
+        X: (N, 6) — [R1, R2, R3, V+, V-, temp]
+        board_dict: from _board_to_dict
+        device: 'cuda', 'cpu', or None
+
+    Returns:
+        (N, 4) — [v_out_high, v_out_low, avg_power, converged]
+    """
+    from model.network import (
+        input_names, n_solver_vars, network_truth_table,
+        count_midpoints, Leaf, Series, Parallel,
+    )
+    from model import solve_network as cpu_solve_network, NChannelJFET
+
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    dev = torch.device(device)
+    dt = torch.float64
+
+    N = X.shape[0]
+    names = input_names(network)
+    n_inputs = len(names)
+    n_vars = n_solver_vars(network)
+    n_mids = count_midpoints(network)
+    table = network_truth_table(network)
+    n_tt = len(table)
+
+    r1 = torch.tensor(X[:, 0], dtype=dt, device=dev)
+    r2 = torch.tensor(X[:, 1], dtype=dt, device=dev)
+    r3 = torch.tensor(X[:, 2], dtype=dt, device=dev)
+    v_pos = torch.tensor(X[:, 3], dtype=dt, device=dev)
+    v_neg = torch.tensor(X[:, 4], dtype=dt, device=dev)
+    r_load = r2 + r3
+
+    mean_temp = float(X[:, 5].mean())
+    vt_val = K_BOLTZ * (mean_temp + 273.15) / Q_ELEC
+    vt = torch.full((N,), vt_val, dtype=dt, device=dev)
+    jp = _temp_scale_jfet(board_dict["jfet_params"], mean_temp)
+    v_high, v_low = board_dict["v_high"], board_dict["v_low"]
+
+    # --- Initial guesses ---
+    hardcoded_ab = [(5.0, 3.0), (5.0, 0.0), (1.0, -1.0), (10.0, 5.0)]
+
+    # CPU seed per truth table entry
+    jfet_cpu = NChannelJFET(**board_dict["jfet_params"]).at_temp(mean_temp)
+    cpu_seeds = []
+    v_map = {False: v_low, True: v_high}
+    for combo, _ in table:
+        v_ins_dict = {names[i]: v_map[combo[i]] for i in range(n_inputs)}
+        try:
+            res = cpu_solve_network(network, v_ins_dict,
+                                    board_dict["v_pos"], board_dict["v_neg"],
+                                    10000.0, 3000.0, 3000.0,
+                                    jfet_cpu, jfet_cpu, mean_temp)
+            vals = [res["v_a"], res["v_b"]] + list(res.get("v_mids", []))
+        except Exception:
+            vals = [5.0, 3.0] + [2.5] * n_mids
+        cpu_seeds.append(vals)
+
+    n_hardcoded = len(hardcoded_ab)
+    n_guesses = n_hardcoded + 1  # hardcoded + CPU seed
+
+    # --- Build mega-batch ---
+    mega_size = N * n_tt * n_guesses
+
+    x0 = torch.zeros(mega_size, n_vars, dtype=dt, device=dev)
+    r1_mega = torch.zeros(mega_size, dtype=dt, device=dev)
+    r_load_mega = torch.zeros(mega_size, dtype=dt, device=dev)
+    v_pos_mega = torch.zeros(mega_size, dtype=dt, device=dev)
+    v_neg_mega = torch.zeros(mega_size, dtype=dt, device=dev)
+    vt_mega = torch.zeros(mega_size, dtype=dt, device=dev)
+    # Input voltages per JFET input name
+    v_ins_mega = {name: torch.zeros(mega_size, dtype=dt, device=dev) for name in names}
+
+    idx = 0
+    for t_idx, (combo, _) in enumerate(table):
+        for g_idx in range(n_guesses):
+            sl = slice(idx, idx + N)
+            r1_mega[sl] = r1
+            r_load_mega[sl] = r_load
+            v_pos_mega[sl] = v_pos
+            v_neg_mega[sl] = v_neg
+            vt_mega[sl] = vt
+
+            for k, name in enumerate(names):
+                v_ins_mega[name][sl] = v_high if combo[k] else v_low
+
+            # Initial guess
+            if g_idx < n_hardcoded:
+                va_g, vb_g = hardcoded_ab[g_idx]
+                x0[sl, 0] = va_g
+                x0[sl, 1] = vb_g
+                for mk in range(n_mids):
+                    x0[sl, 2 + mk] = va_g * (n_mids - mk) / max(n_mids + 1, 1)
+            else:
+                seed = cpu_seeds[t_idx]
+                for v_idx, val in enumerate(seed):
+                    if v_idx < n_vars:
+                        x0[sl, v_idx] = val
+
+            idx += N
+
+    # --- ONE Newton solve ---
+    def res_fn(x):
+        return _network_residuals_gpu(x, v_ins_mega, r1_mega, r_load_mega,
+                                       v_pos_mega, v_neg_mega, vt_mega, jp, network)
+
+    x_sol, conv_mega = _newton_batch(res_fn, x0, n_vars, max_steps=25, tol=1e-8)
+
+    F_final = res_fn(x_sol)
+    res_mag = F_final.abs().amax(dim=1)
+
+    # --- Unstack and pick best ---
+    res_mag = res_mag.view(n_tt, n_guesses, N)
+    x_sol = x_sol.view(n_tt, n_guesses, N, n_vars)
+
+    best_g = res_mag.argmin(dim=1)
+    sample_idx = torch.arange(N, device=dev)
+
+    v_out_high = torch.zeros(N, dtype=dt, device=dev)
+    v_out_low = torch.zeros(N, dtype=dt, device=dev)
+    total_power = torch.zeros(N, dtype=dt, device=dev)
+    all_converged = torch.ones(N, dtype=torch.bool, device=dev)
+
+    for t_idx, (combo, _) in enumerate(table):
+        bg = best_g[t_idx]
+        x_best = x_sol[t_idx, bg, sample_idx]
+        res_best = res_mag[t_idx, bg, sample_idx]
+        entry_conv = res_best < 1e-4
+        all_converged = all_converged & entry_conv
+
+        v_a = x_best[:, 0]
+        v_b = x_best[:, 1]
+
+        i_load = (v_b - v_neg) / r_load
+        v_out = v_neg + i_load * r3
+
         i_r1 = (v_pos - v_a) / r1
         i_j2 = _ids_j(v_a - v_b, v_pos - v_b, jp)
         total_power = total_power + v_pos * (i_r1 + i_j2) + (-v_neg) * i_load

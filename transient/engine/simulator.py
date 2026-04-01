@@ -1,4 +1,4 @@
-"""Transient simulator for any N-input JFET gate (INV, NOR-N, NAND-N)."""
+"""Transient simulator for any JFET gate topology."""
 
 import numpy as np
 from scipy.integrate import solve_ivp
@@ -7,22 +7,24 @@ from typing import Callable, List
 
 from model import (
     NChannelJFET, JFETCapacitance, GateType,
-    solve_any_gate, thermal_voltage,
+    solve_any_gate, solve_network, thermal_voltage,
+)
+from model.network import (
+    PulldownNetwork, input_names as net_input_names,
+    count_midpoints, gate_type_to_network,
 )
 from .ode import gate_ode
 
 
 @dataclass
 class Circuit:
-    """Complete circuit description for transient simulation.
+    """Circuit description for transient simulation.
 
-    Supports INV, NOR-N (parallel J1s), and NAND-N (series J1s).
+    Accepts either a GateType enum (backward compat) or a PulldownNetwork.
 
-    For INV: provide v_in_funcs=[func] (single input)
-    For NOR2: provide v_in_funcs=[func_a, func_b]
-    For NAND3: provide v_in_funcs=[func_a, func_b, func_c]
-
-    Legacy: v_in_func (single callable) still works for INV.
+    For INV: v_in_funcs=[func_a]
+    For NOR2: v_in_funcs=[func_a, func_b]
+    For A NOR (B NAND C): v_in_funcs=[func_a, func_b, func_c]
     """
     v_pos: float
     v_neg: float
@@ -32,83 +34,74 @@ class Circuit:
     j1: NChannelJFET
     j2: NChannelJFET
     caps: JFETCapacitance
-    v_in_func: Callable[[float], float] = None
+    v_in_func: Callable[[float], float] = None     # legacy single input
     v_in_funcs: List[Callable[[float], float]] = None
     gate_type_enum: GateType = None
+    network: PulldownNetwork = None
     n_fanout: int = 1
     temp_c: float = 27.0
 
     # Derived fields
-    gate_type: str = field(init=False)
+    input_names: list = field(init=False)
     n_inputs: int = field(init=False)
+    n_midpoints: int = field(init=False)
     c_a: float = field(init=False)
     c_b: float = field(init=False)
     c_out: float = field(init=False)
     vt: float = field(init=False)
 
     def __post_init__(self):
-        # Handle legacy single v_in_func
+        # Handle input functions
         if self.v_in_funcs is None:
             if self.v_in_func is not None:
                 self.v_in_funcs = [self.v_in_func]
             else:
                 raise ValueError("Must provide v_in_func or v_in_funcs")
 
-        self.n_inputs = len(self.v_in_funcs)
-
-        # Auto-detect gate type from enum or n_inputs
-        if self.gate_type_enum is not None:
-            gt = self.gate_type_enum.value
-            if gt == "INV":
-                self.gate_type = "INV"
-            elif gt.startswith("NOR"):
-                self.gate_type = "NOR"
-            elif gt.startswith("NAND"):
-                self.gate_type = "NAND"
+        # Determine topology
+        if self.network is None:
+            if self.gate_type_enum is not None:
+                self.network = gate_type_to_network(self.gate_type_enum)
             else:
-                self.gate_type = "INV"
-        elif self.n_inputs == 1:
-            self.gate_type = "INV"
-        else:
-            # Default to NOR for multiple inputs (user should set gate_type_enum)
-            self.gate_type = "NOR"
+                # Default: single input = INV
+                from model.network import Leaf
+                n = len(self.v_in_funcs)
+                if n == 1:
+                    self.network = Leaf("A")
+                else:
+                    from model.network import Parallel
+                    names = [chr(ord('A') + i) for i in range(n)]
+                    self.network = Parallel(tuple(Leaf(nm) for nm in names))
+
+        self.input_names = net_input_names(self.network)
+        self.n_inputs = len(self.input_names)
+        self.n_midpoints = count_midpoints(self.network)
 
         # Capacitances
-        self.c_a = self.caps.cgd0 + self.caps.cgs0   # Cgd_J1 + Cgs_J2
-        self.c_b = self.caps.cgd0                     # Cgd_J2
+        self.c_a = self.caps.cgd0 + self.caps.cgs0
+        self.c_b = self.caps.cgd0
         self.c_out = self.n_fanout * self.caps.c_per_input
         self.vt = thermal_voltage(self.temp_c + 273.15)
 
 
 def compute_initial_conditions(circuit: Circuit) -> np.ndarray:
-    """Get DC initial conditions using the static solver.
+    """DC initial conditions via static solver.
 
-    Returns state vector at t=0:
-      INV/NOR: [v_a, v_b, v_out]
-      NAND-N:  [v_a, v_b, v_out, v_mid_0, ..., v_mid_{N-2}]
+    Returns [v_a, v_b, v_out, mid_0, ..., mid_{N-1}].
     """
     c = circuit
     t0_inputs = [fn(0.0) for fn in c.v_in_funcs]
+    v_ins_dict = {c.input_names[i]: t0_inputs[i] for i in range(c.n_inputs)}
 
-    if c.gate_type == "INV":
-        gt = GateType.INV
-    elif c.gate_type == "NOR":
-        gt = GateType(f"NOR{c.n_inputs}")
-    elif c.gate_type == "NAND":
-        gt = GateType(f"NAND{c.n_inputs}")
-    else:
-        gt = GateType.INV
-
-    res = solve_any_gate(gt, t0_inputs, c.v_pos, c.v_neg,
-                         c.r1, c.r2, c.r3, c.j1, c.j2, c.temp_c)
+    res = solve_network(c.network, v_ins_dict, c.v_pos, c.v_neg,
+                        c.r1, c.r2, c.r3, c.j1, c.j2, c.temp_c)
 
     y0 = [res["v_a"], res["v_b"], res["v_out"]]
-
-    # NAND midpoints
-    if c.gate_type == "NAND" and c.n_inputs > 1:
-        v_mids = res.get("v_mids", [])
-        y0.extend(v_mids)
-
+    mids = res.get("v_mids", [])
+    # Clamp midpoint values to physical range (between 0 and v_a)
+    v_a = res["v_a"]
+    for m in mids:
+        y0.append(np.clip(float(m), 0.0, max(v_a, 0.0)))
     return np.array(y0)
 
 
@@ -121,11 +114,7 @@ def simulate(
     rtol: float = 1e-6,
     atol: float = 1e-9,
 ) -> dict:
-    """Run a transient simulation for any gate type.
-
-    Returns dict with 't', 'v_a', 'v_b', 'v_out', 'v_ins' arrays,
-    plus 'v_mids' for NAND gates.
-    """
+    """Run transient simulation for any gate topology."""
     y0 = compute_initial_conditions(circuit)
 
     def rhs(t, y):
@@ -141,7 +130,6 @@ def simulate(
     if not sol.success:
         print(f"Warning: solver did not converge: {sol.message}")
 
-    # Build input voltage arrays
     n_ins = circuit.n_inputs
     v_ins_arr = np.zeros((n_ins, len(sol.t)))
     for k in range(n_ins):
@@ -152,16 +140,14 @@ def simulate(
         "v_a": sol.y[0],
         "v_b": sol.y[1],
         "v_out": sol.y[2],
-        "v_in": v_ins_arr[0],  # legacy: first input
-        "v_ins": v_ins_arr,     # all inputs: (n_inputs, n_time)
+        "v_in": v_ins_arr[0],
+        "v_ins": v_ins_arr,
         "success": sol.success,
         "message": sol.message,
         "n_eval": sol.nfev,
     }
 
-    # NAND midpoints
-    if circuit.gate_type == "NAND" and circuit.n_inputs > 1:
-        n_mids = circuit.n_inputs - 1
-        result["v_mids"] = sol.y[3:3 + n_mids]
+    if circuit.n_midpoints > 0:
+        result["v_mids"] = sol.y[3:3 + circuit.n_midpoints]
 
     return result
