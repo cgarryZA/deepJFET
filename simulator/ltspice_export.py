@@ -1,8 +1,7 @@
 """Export a Netlist to LTSpice .asc schematic format.
 
-Each gate becomes: R1 + J1 pull-down network + J2 (load) + R2 + R3
-arranged vertically. Gates are placed side by side horizontally.
-Wires connect gate outputs to downstream gate inputs.
+Each gate becomes: R1 + J1 (pull-down) + J2 (load) + R2 + R3.
+Layout matches hand-built LTSpice schematics with proper grid alignment.
 """
 
 from simulator.netlist import Netlist, Gate
@@ -14,136 +13,114 @@ from model.network import (
 from model import GateType
 
 
-# LTSpice coordinate grid: symbols snap to 16-unit grid
-# One gate takes about 400 units wide, 800 units tall
-
-GATE_WIDTH = 800
-GATE_HEIGHT = 1200
-GATE_SPACING = 200
+# LTSpice snaps to 16-unit grid. All coordinates must be multiples of 16.
+# Gate horizontal spacing ~1000 units.
+GATE_PITCH = 1056
 
 
-def _sym(sym_type, x, y, rot="R0", inst_name=None, value=None, windows=None):
-    """Generate SYMBOL + SYMATTR lines."""
-    lines = [f"SYMBOL {sym_type} {x} {y} {rot}"]
-    if windows:
-        for w in windows:
-            lines.append(w)
-    if inst_name:
-        lines.append(f"SYMATTR InstName {inst_name}")
-    if value:
-        lines.append(f"SYMATTR Value {value}")
-    return lines
+def _align(v):
+    """Snap to nearest 16-unit grid."""
+    return round(v / 16) * 16
 
 
-def _wire(x1, y1, x2, y2):
-    return f"WIRE {x1} {y1} {x2} {y2}"
+def _emit_gate_inv(lines, gate_name, params, x, y, input_labels,
+                   output_label, jfet_model, counter):
+    """Emit one INV gate (or NOR with parallel J1s) at position (x, y).
 
-
-def _flag(x, y, label):
-    return f"FLAG {x} {y} {label}"
-
-
-def _text(x, y, text, size=2):
-    return f"TEXT {x} {y} Left {size} !{text}"
-
-
-def _comment(x, y, text, size=2):
-    return f"TEXT {x} {y} Left {size} ;{text}"
-
-
-def _export_inv_gate(gate_name, params, x_base, y_base,
-                     input_net_labels, output_net_label,
-                     jfet_model, counter):
-    """Generate LTSpice elements for a single INV/NOR gate.
-
-    For NOR: multiple J1s in parallel at Node A.
-    Returns (lines, updated_counter).
+    Layout (relative to x, y as top-left origin):
+      R1:  (x, y+100) vertical, VDD at top
+      J1:  (x-184, y+400) pull-down, gate left to input label
+      J2:  (x+136, y+336) load, drain up to (x+184, y+298)=VDD
+      R2:  (x+168, y+462)
+      R3:  (x+168, y+602)
+      Output label at (x+184, y+572)
+      VSS at (x+184, y+752)
     """
-    lines = []
     r1, r2, r3 = params.r1, params.r2, params.r3
-    n_inputs = len(input_net_labels)
+    n_ins = len(input_labels)
 
-    # Coordinate layout (vertical, top to bottom):
-    # VDD ---- R1 ---- Node_A ---- J1(drain)  J1(source) ---- GND
-    #                   |
-    #          VDD ---- J2(drain)  J2(source) ---- Node_B
-    #                                               |
-    #                                         R2 -- V_OUT -- R3 -- VSS
-
-    x = x_base
-    y = y_base
-
-    # Node A position
-    node_a_x = x
-    node_a_y = y + 400
-
-    # R1: from VDD down to Node A
-    r1_y = y + 100
-    lines.append(_wire(x, y, x, r1_y))  # VDD to R1 top
-    lines.append(_flag(x, y, "VDD"))
-    lines.extend(_sym("res", x - 16, r1_y, "R0",
-                       f"R1_{counter[0]}", f"{r1:.0f}"))
+    # -- R1: VDD to Node A --
+    lines.append(f"WIRE {x} {y+116} {x} {y+16}")
+    lines.append(f"FLAG {x} {y+16} VDD")
+    lines.append(f"SYMBOL res {x-16} {y+100} R0")
+    lines.append(f"SYMATTR InstName R1_{counter[0]}")
+    lines.append(f"SYMATTR Value {r1:.0f}")
     counter[0] += 1
-    lines.append(_wire(x, r1_y + 96, x, node_a_y))  # R1 bottom to Node A
 
-    # J1s: parallel, each from Node A to GND
-    for k in range(n_inputs):
-        j1_x = x - 200 - k * 300
-        j1_y = node_a_y
+    # Node A area: y+400
+    na_y = y + 400
+
+    # Wire from R1 bottom to Node A
+    lines.append(f"WIRE {x} {na_y} {x} {y+196}")
+
+    # -- J1 pull-down JFETs (parallel for NOR) --
+    for k in range(n_ins):
+        j1_x = x - 184 - k * 256
+        j1_y = na_y
 
         # Wire from Node A to J1 drain
-        lines.append(_wire(node_a_x, node_a_y, j1_x + 64, node_a_y))
-        # J1 symbol (njf): gate on left, drain on top, source on bottom
-        lines.extend(_sym("njf", j1_x, j1_y, "R0",
-                           f"J1_{gate_name}_{k}", jfet_model))
+        lines.append(f"WIRE {x} {na_y} {j1_x+48} {na_y}")
+        # J1 symbol
+        lines.append(f"SYMBOL njf {j1_x} {j1_y} R0")
+        lines.append(f"SYMATTR InstName J1_{gate_name}_{k}")
+        lines.append(f"SYMATTR Value {jfet_model}")
         # J1 source to GND
-        j1_source_y = j1_y + 128
-        lines.append(_wire(j1_x + 64, j1_source_y, j1_x + 64, j1_source_y + 50))
-        lines.append(_flag(j1_x + 64, j1_source_y + 50, "0"))
-        # J1 gate label (input net)
-        lines.append(_wire(j1_x, j1_y + 64, j1_x - 80, j1_y + 64))
-        lines.append(_flag(j1_x - 80, j1_y + 64, input_net_labels[k]))
+        lines.append(f"WIRE {j1_x+48} {j1_y+96} {j1_x+48} {j1_y+144}")
+        lines.append(f"FLAG {j1_x+48} {j1_y+144} 0")
+        # J1 gate wire to input label
+        lines.append(f"WIRE {j1_x} {j1_y+64} {j1_x-80} {j1_y+64}")
+        lines.append(f"FLAG {j1_x-80} {j1_y+64} {input_labels[k]}")
 
-    # J2: load transistor. Gate = Node A, Drain = VDD, Source = Node B
-    j2_x = x + 200
-    j2_y = node_a_y - 100
+    # -- J2 load transistor --
+    j2_x = x + 136
+    j2_y = y + 336
 
-    # J2 gate wire from Node A
-    lines.append(_wire(node_a_x, node_a_y, j2_x, node_a_y))
-    lines.append(_wire(j2_x, node_a_y, j2_x, j2_y + 64))  # down to gate
+    # Wire from Node A right to J2 area
+    lines.append(f"WIRE {x} {na_y} {j2_x} {na_y}")
 
-    # J2 symbol
-    lines.extend(_sym("njf", j2_x, j2_y, "M0",  # mirrored for load
-                       f"J2_{gate_name}", jfet_model))
-    # J2 drain to VDD
-    lines.append(_wire(j2_x + 64, j2_y, j2_x + 64, j2_y - 50))
-    lines.append(_flag(j2_x + 64, j2_y - 50, "VDD"))
-    # J2 source = Node B
-    node_b_x = j2_x + 64
-    node_b_y = j2_y + 128
+    # J2 symbol (R0, same orientation as J1)
+    lines.append(f"SYMBOL njf {j2_x} {j2_y} R0")
+    lines.append(f"SYMATTR InstName J2_{gate_name}")
+    lines.append(f"SYMATTR Value {jfet_model}")
 
-    # R2: Node B to V_OUT
-    r2_y = node_b_y + 50
-    lines.append(_wire(node_b_x, node_b_y, node_b_x, r2_y))
-    lines.extend(_sym("res", node_b_x - 16, r2_y, "R0",
-                       f"R2_{counter[0]}", f"{r2:.0f}"))
+    # J2 drain goes UP to VDD
+    j2_drain_x = j2_x + 48
+    lines.append(f"WIRE {j2_drain_x} {j2_y} {j2_drain_x} {y+298}")
+    lines.append(f"FLAG {j2_drain_x} {y+298} VDD")
+
+    # J2 gate wire down from Node A
+    # J2 gate pin is at (j2_x, j2_y+64) — need wire from Node A level
+    lines.append(f"WIRE {j2_x} {j2_y+64} {j2_x} {na_y}")
+
+    # J2 source = Node B, goes down to R2
+    node_b_x = j2_drain_x
+    node_b_y = j2_y + 96
+
+    # -- R2 --
+    r2_y = y + 462
+    lines.append(f"WIRE {node_b_x} {node_b_y} {node_b_x} {r2_y}")
+    lines.append(f"SYMBOL res {node_b_x-16} {r2_y} R0")
+    lines.append(f"SYMATTR InstName R2_{counter[0]}")
+    lines.append(f"SYMATTR Value {r2:.0f}")
     counter[0] += 1
 
-    # V_OUT node
-    vout_y = r2_y + 96 + 30
-    lines.append(_wire(node_b_x, r2_y + 96, node_b_x, vout_y))
-    lines.append(_flag(node_b_x, vout_y, output_net_label))
+    # -- Output node between R2 and R3 --
+    out_y = y + 572
+    lines.append(f"WIRE {node_b_x} {r2_y+96} {node_b_x} {out_y}")
+    lines.append(f"FLAG {node_b_x} {out_y} {output_label}")
 
-    # R3: V_OUT to VSS
-    r3_y = vout_y + 30
-    lines.append(_wire(node_b_x, vout_y, node_b_x, r3_y))
-    lines.extend(_sym("res", node_b_x - 16, r3_y, "R0",
-                       f"R3_{counter[0]}", f"{r3:.0f}"))
+    # -- R3 --
+    r3_y = y + 602
+    lines.append(f"WIRE {node_b_x} {out_y} {node_b_x} {r3_y}")
+    lines.append(f"SYMBOL res {node_b_x-16} {r3_y} R0")
+    lines.append(f"SYMATTR InstName R3_{counter[0]}")
+    lines.append(f"SYMATTR Value {r3:.0f}")
     counter[0] += 1
-    lines.append(_wire(node_b_x, r3_y + 96, node_b_x, r3_y + 150))
-    lines.append(_flag(node_b_x, r3_y + 150, "VSS"))
 
-    return lines
+    # VSS
+    vss_y = y + 752
+    lines.append(f"WIRE {node_b_x} {r3_y+96} {node_b_x} {vss_y}")
+    lines.append(f"FLAG {node_b_x} {vss_y} VSS")
 
 
 def export_netlist_asc(
@@ -163,13 +140,13 @@ def export_netlist_asc(
     Args:
         netlist: Gate netlist
         gate_params: gate_name -> CircuitParams
-        gate_networks: gate_name -> PulldownNetwork (optional, inferred from GateType)
-        stimuli: net_name -> dict with 'type', 'v1', 'v2', 'td', 'tr', 'tf', 'pw', 'per'
+        gate_networks: gate_name -> PulldownNetwork (optional)
+        stimuli: net_name -> dict with PULSE params or string
         jfet_model: SPICE model name
-        jfet_model_card: full .model line (auto-generated if None)
+        jfet_model_card: full .model line
         v_pos, v_neg: supply voltages
-        sim_time: simulation time
-        output_path: where to save the .asc file
+        sim_time: transient simulation time
+        output_path: output file path
     """
     lines = [
         "Version 4",
@@ -181,52 +158,47 @@ def export_netlist_asc(
         for g in netlist.gates.values():
             gate_networks[g.name] = gate_type_to_network(g.gate_type)
 
-    # Layout gates horizontally
     ordered, feedback = netlist.topological_sort()
     all_gates = ordered + feedback
 
-    counter = [0]  # mutable counter for unique component names
-    x_pos = 0
+    counter = [0]
+    y_origin = 0
 
-    for gname in all_gates:
+    for i, gname in enumerate(all_gates):
         gate = netlist.gates[gname]
         params = gate_params[gname]
-        network = gate_networks[gname]
+        x = i * GATE_PITCH
 
-        # Get input/output net labels
-        in_labels = gate.inputs
-        out_label = gate.output
-
-        gate_lines = _export_inv_gate(
-            gname, params, x_pos, 0,
-            in_labels, out_label,
+        _emit_gate_inv(
+            lines, gname, params, x, y_origin,
+            gate.inputs, gate.output,
             jfet_model, counter,
         )
-        lines.extend(gate_lines)
 
-        # Add gate name comment
-        lines.append(_comment(x_pos - 50, -100, f"{gname} ({gate.gate_type.value})"))
+        # Gate name label
+        lines.append(f"TEXT {x-48} {y_origin-104} Left 2 ;{gname} ({gate.gate_type.value})")
 
-        x_pos += GATE_WIDTH + GATE_SPACING
+    # Supply voltage sources (far left)
+    sx = -500
+    lines.append(f"FLAG {sx} {16} VDD")
+    lines.append(f"FLAG {sx} {96} 0")
+    lines.append(f"SYMBOL voltage {sx} 0 R0")
+    lines.append(f"SYMATTR InstName V_VDD")
+    lines.append(f"SYMATTR Value {v_pos}")
 
-    # Supply voltage sources
-    supply_x = -500
-    lines.extend(_sym("voltage", supply_x, 0, "R0", "V_VDD", f"{v_pos}"))
-    lines.append(_flag(supply_x, 0, "VDD"))
-    lines.append(_flag(supply_x, 96, "0"))
+    lines.append(f"FLAG {sx} {216} VSS")
+    lines.append(f"FLAG {sx} {296} 0")
+    lines.append(f"SYMBOL voltage {sx} 200 R0")
+    lines.append(f"SYMATTR InstName V_VSS")
+    lines.append(f"SYMATTR Value {v_neg}")
 
-    lines.extend(_sym("voltage", supply_x, 200, "R0", "V_VSS", f"{v_neg}"))
-    lines.append(_flag(supply_x, 200, "VSS"))
-    lines.append(_flag(supply_x, 296, "0"))
-
-    # Input stimulus sources
+    # Stimulus sources
     if stimuli:
-        stim_x = -500
         stim_y = 500
         for net_name, stim in stimuli.items():
             if isinstance(stim, dict):
                 v1 = stim.get("v1", -4.0)
-                v2 = stim.get("v2", 0.0)
+                v2 = stim.get("v2", -0.8)
                 td = stim.get("td", 10e-6)
                 tr = stim.get("tr", 0.1e-6)
                 tf = stim.get("tf", 0.1e-6)
@@ -236,13 +208,14 @@ def export_netlist_asc(
             else:
                 val = str(stim)
 
-            lines.extend(_sym("voltage", stim_x, stim_y, "R0",
-                               f"V_{net_name}", val))
-            lines.append(_flag(stim_x, stim_y, net_name))
-            lines.append(_flag(stim_x, stim_y + 96, "0"))
+            lines.append(f"FLAG {sx} {stim_y+16} {net_name}")
+            lines.append(f"FLAG {sx} {stim_y+96} 0")
+            lines.append(f"SYMBOL voltage {sx} {stim_y} R0")
+            lines.append(f"SYMATTR InstName V_{net_name}")
+            lines.append(f"SYMATTR Value {val}")
             stim_y += 200
 
-    # JFET model card
+    # Model card and simulation command
     if jfet_model_card is None:
         jfet_model_card = (
             f".model {jfet_model} NJF(Beta=0.135m Betatce=-0.5 Vto=-3.45 "
@@ -251,11 +224,9 @@ def export_netlist_asc(
             "Vk=123.7 M=407m Pb=1)"
         )
 
-    text_y = -300
-    lines.append(_text(-500, text_y, f".tran 0 {sim_time} 0 {sim_time/4000}"))
-    lines.append(_text(-500, text_y - 50, jfet_model_card))
+    lines.append(f"TEXT {sx-4} -304 Left 2 !.tran 0 {sim_time} 0 {sim_time/4000}")
+    lines.append(f"TEXT {sx-4} -352 Left 2 !{jfet_model_card}")
 
-    # Write file
     with open(output_path, "w") as f:
         f.write("\n".join(lines) + "\n")
 
