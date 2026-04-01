@@ -1,10 +1,9 @@
-"""Surrogate-based optimizer -- replaces the grid-search fsolve loop with NN inference.
+"""Surrogate-based optimizer using DC NN + optional Delay NN.
 
-Given a trained GateSurrogateNet, sweeps the full E-series grid in a single
-batched forward pass, then verifies top candidates with the real solver.
+DC NN: predicts V_out_high, V_out_low, power from R1/R2/R3/V+/V-/temp
+Delay NN: predicts t_pd_hl, t_pd_lh in nanoseconds (replaces RC estimate)
 
-Error is computed from V_out predictions vs target logic levels, NOT predicted
-by the NN directly. This gives much better ranking in the low-error region.
+Error is computed from V_out predictions vs target logic levels.
 """
 
 import time
@@ -13,7 +12,7 @@ import torch
 
 from model import (
     GateType, solve_any_gate, e_series_values,
-    estimate_prop_delay, max_r_out_for_freq,
+    estimate_prop_delay,
 )
 from simulator.optimize import BoardConfig, GateDesign
 from simulator.gate_models import truth_table
@@ -21,102 +20,97 @@ from .model import GateSurrogateNet
 
 
 class SurrogateOptimizer:
-    """Fast optimizer using a trained NN surrogate.
+    """Optimizer using DC NN + optional Delay NN.
 
     Usage::
 
-        opt = SurrogateOptimizer(model, board)
-        design = opt.optimize(GateType.NAND2, top_n_verify=50)
+        opt = SurrogateOptimizer(dc_model, board, delay_model=delay_model)
+        design = opt.optimize(GateType.INV, mode='min_power')
+        design = opt.optimize(GateType.INV, mode='max_freq', max_power_mW=100)
     """
 
     def __init__(self, model: GateSurrogateNet, board: BoardConfig,
+                 delay_model: GateSurrogateNet = None,
                  device: str = None):
         self.model = model
+        self.delay_model = delay_model
         self.board = board
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
         self.model.eval()
+        if self.delay_model is not None:
+            self.delay_model.to(self.device)
+            self.delay_model.eval()
 
-    def _build_grid(self, series: str, r1_range: tuple, r23_range: tuple,
-                    apply_speed_filter: bool = True):
-        """Build the full E-series grid as a numpy array."""
+    def _build_grid(self, series: str, r1_range: tuple, r23_range: tuple):
+        """Build full E-series grid."""
         r1_vals = e_series_values(series, r1_range[0], r1_range[1])
         r2_vals = e_series_values(series, r23_range[0], r23_range[1])
         r3_vals = e_series_values(series, r23_range[0], r23_range[1])
 
-        cgd = self.board.caps.cgd0
-        cgs = self.board.caps.cgs0
-
-        if apply_speed_filter:
-            max_delay = self.board.max_gate_delay
-            r_out_max = max_delay / (5.0 * self.board.n_fanout * (cgd + cgs))
-        else:
-            max_delay = float('inf')
-            r_out_max = float('inf')
-
         grid = []
         for r1 in r1_vals:
-            if 0.7 * r1 * (cgd + cgs) > max_delay:
-                continue
             for r2 in r2_vals:
                 for r3 in r3_vals:
-                    r_out = (r2 * r3) / (r2 + r3)
-                    if r_out > r_out_max:
-                        continue
-                    if apply_speed_filter:
-                        d = estimate_prop_delay(r1, r2, r3, cgd, cgs,
-                                                self.board.n_fanout)
-                        if d > max_delay:
-                            continue
                     grid.append((r1, r2, r3))
 
         return np.array(grid, dtype=np.float32)
 
-    def predict_grid(self, grid: np.ndarray) -> np.ndarray:
-        """Run the NN on a grid of (R1, R2, R3) values.
-
-        Returns (N, 3): V_out_high, V_out_low, avg_power
-        """
+    def _predict_dc(self, grid: np.ndarray) -> np.ndarray:
+        """DC NN prediction. Returns (N, 3): V_out_high, V_out_low, power."""
         n = len(grid)
-        # Build full feature matrix: [R1, R2, R3, V+, V-, temp]
         X = np.empty((n, 6), dtype=np.float32)
         X[:, 0:3] = grid
         X[:, 3] = self.board.v_pos
         X[:, 4] = self.board.v_neg
         X[:, 5] = self.board.temp_c
 
-        # Batched inference
         batch_size = 65536
         preds = []
         with torch.no_grad():
             for i in range(0, n, batch_size):
                 xb = torch.tensor(X[i:i + batch_size],
-                                  dtype=torch.float32,
-                                  device=self.device)
+                                  dtype=torch.float32, device=self.device)
                 preds.append(self.model(xb).cpu().numpy())
-
         return np.vstack(preds)
 
+    def _predict_delay(self, grid: np.ndarray) -> np.ndarray:
+        """Delay NN prediction. Returns (N, 2): t_pd_hl_ns, t_pd_lh_ns."""
+        if self.delay_model is None:
+            # Fallback to RC estimate
+            delays = np.zeros((len(grid), 2), dtype=np.float32)
+            cgd = self.board.caps.cgd0
+            cgs = self.board.caps.cgs0
+            for i, (r1, r2, r3) in enumerate(grid):
+                d = estimate_prop_delay(r1, r2, r3, cgd, cgs,
+                                        self.board.n_fanout)
+                delays[i] = [d * 1e9, d * 1e9]  # same for both directions
+            return delays
+
+        from .delay_model import predict_delay
+        n = len(grid)
+        X = np.empty((n, 6), dtype=np.float32)
+        X[:, 0:3] = grid
+        X[:, 3] = self.board.v_pos
+        X[:, 4] = self.board.v_neg
+        X[:, 5] = self.board.temp_c
+        return predict_delay(self.delay_model, X, device=self.device)
+
     def _compute_error(self, preds: np.ndarray) -> np.ndarray:
-        """Compute max logic-level error from V_out predictions.
-
-        preds[:, 0] = predicted V_out_high (should match board.v_high)
-        preds[:, 1] = predicted V_out_low  (should match board.v_low)
-
-        Returns (N,) array of max absolute error in volts.
-        """
+        """Max logic-level error from DC predictions."""
         err_high = np.abs(preds[:, 0] - self.board.v_high)
         err_low = np.abs(preds[:, 1] - self.board.v_low)
         return np.maximum(err_high, err_low)
 
     def _verify_with_solver(self, gate_type: GateType,
-                            candidates: np.ndarray) -> list:
-        """Run the real solver on candidate (R1, R2, R3) combos."""
+                            candidates: np.ndarray,
+                            candidate_delays: np.ndarray = None) -> list:
+        """Run DC solver on candidates. Use delay NN predictions if available."""
         table = truth_table(gate_type)
         v_map = {False: self.board.v_low, True: self.board.v_high}
         results = []
 
-        for row in candidates:
+        for idx, row in enumerate(candidates):
             r1, r2, r3 = float(row[0]), float(row[1]), float(row[2])
             max_err = 0.0
             total_power = 0.0
@@ -135,13 +129,11 @@ class SurrogateOptimizer:
                                          self.board.temp_c)
                     err = abs(res["v_out"] - target)
                     max_err = max(max_err, err)
-
                     i_r1 = res["i_r1_mA"] * 1e-3
                     i_j2 = res["i_j2_mA"] * 1e-3
                     i_load = res["i_load_mA"] * 1e-3
                     total_power += (self.board.v_pos * (i_r1 + i_j2)
                                     + (-self.board.v_neg) * i_load)
-
                     if all(not b for b in combo):
                         v_out_high = res["v_out"]
                     if all(b for b in combo):
@@ -154,12 +146,18 @@ class SurrogateOptimizer:
 
             n_states = len(table)
             avg_power = total_power / n_states
-            delay = estimate_prop_delay(r1, r2, r3,
-                                        self.board.caps.cgd0,
-                                        self.board.caps.cgs0,
-                                        self.board.n_fanout)
+
+            # Use delay NN prediction if available, else RC estimate
+            if candidate_delays is not None:
+                delay_ns = float(max(candidate_delays[idx, 0],
+                                     candidate_delays[idx, 1]))
+            else:
+                delay_ns = estimate_prop_delay(
+                    r1, r2, r3, self.board.caps.cgd0,
+                    self.board.caps.cgs0, self.board.n_fanout) * 1e9
+
             results.append((max_err, avg_power, r1, r2, r3,
-                            v_out_high, v_out_low, delay))
+                            v_out_high, v_out_low, delay_ns))
 
         return results
 
@@ -171,37 +169,22 @@ class SurrogateOptimizer:
                  top_n_verify: int = 50,
                  mode: str = "min_power",
                  max_power_mW: float = 100.0) -> GateDesign:
-        """Full optimization: NN sweep -> verify top candidates -> pick best.
+        """Optimize gate resistors using DC NN + Delay NN.
 
         Modes:
             'min_power': minimize power subject to error < tol and delay < budget
-            'max_freq':  minimize delay subject to error < tol and power < max_power_mW
-                         (ignores f_target speed constraint, searches full R range)
+            'max_freq':  minimize delay subject to error < tol and power < cap
         """
-        cgd = self.board.caps.cgd0
-        cgs = self.board.caps.cgs0
+        t0 = time.time()
+        max_delay_budget = self.board.max_gate_delay * 1e9  # ns
 
-        if mode == "max_freq":
-            # No speed pre-filter — search full R range for fastest gate
-            if r1_range is None:
-                r1_range = (100, 500_000)
-            if r23_range is None:
-                r23_range = (100, 500_000)
-        else:
-            # Auto-compute R ranges from board timing constraints
-            max_delay = self.board.max_gate_delay
-            r_out_max = max_delay / (5.0 * self.board.n_fanout * (cgd + cgs))
-            r1_max = max_delay / (0.7 * (cgd + cgs))
-            if r1_range is None:
-                r1_range = (100, min(r1_max, 500_000))
-            if r23_range is None:
-                r23_range = (100, min(2 * r_out_max, 500_000))
+        if r1_range is None:
+            r1_range = (100, 500_000)
+        if r23_range is None:
+            r23_range = (100, 500_000)
 
         # Step 1: Build grid
-        t0 = time.time()
-        apply_filter = (mode != "max_freq")
-        grid = self._build_grid(series, r1_range, r23_range,
-                                apply_speed_filter=apply_filter)
+        grid = self._build_grid(series, r1_range, r23_range)
         t1 = time.time()
         print(f"  {gate_type.value}: {series} grid = {len(grid):,} combos "
               f"({t1-t0:.2f}s)")
@@ -218,26 +201,35 @@ class SurrogateOptimizer:
                 temp_c=self.board.temp_c,
             )
 
-        # Step 2: NN prediction
-        preds = self.predict_grid(grid)
+        # Step 2: DC NN prediction
+        preds = self._predict_dc(grid)
         t2 = time.time()
-        print(f"    NN inference: {t2-t1:.3f}s "
+        print(f"    DC inference: {t2-t1:.3f}s "
               f"({len(grid)/(t2-t1):.0f} combos/s)")
 
-        # Step 3: Compute error from V_out predictions (NOT from NN output)
+        # Step 3: Error from V_out + select top candidates
         computed_errors = self._compute_error(preds)
         best_idx = np.argsort(computed_errors)[:top_n_verify]
         top_grid = grid[best_idx]
 
-        print(f"    Top {top_n_verify} computed errors: "
+        print(f"    Top {top_n_verify} errors: "
               f"{computed_errors[best_idx[0]]*1e3:.1f}mV - "
               f"{computed_errors[best_idx[-1]]*1e3:.1f}mV")
 
-        # Step 4: Verify with real solver
-        verified = self._verify_with_solver(gate_type, top_grid)
+        # Step 4: Delay NN on top candidates
+        top_delays = self._predict_delay(top_grid)
         t3 = time.time()
+        has_delay_nn = self.delay_model is not None
+        if has_delay_nn:
+            print(f"    Delay inference: {t3-t2:.3f}s  "
+                  f"range={top_delays.max(axis=1).min():.0f}-"
+                  f"{top_delays.max(axis=1).max():.0f}ns")
+
+        # Step 5: Verify with real DC solver
+        verified = self._verify_with_solver(gate_type, top_grid, top_delays)
+        t4 = time.time()
         print(f"    Verified {len(verified)}/{top_n_verify} candidates "
-              f"({t3-t2:.3f}s)")
+              f"({t4-t3:.3f}s)")
 
         if not verified:
             i = best_idx[0]
@@ -255,54 +247,67 @@ class SurrogateOptimizer:
                 temp_c=self.board.temp_c,
             )
 
-        # Step 5: Pick best result based on mode
+        # Step 6: Pick best based on mode
+        # verified tuples: (err, power, r1, r2, r3, v_h, v_l, delay_ns)
         within_tol = [r for r in verified if r[0] <= max_error_tol]
 
         if mode == "max_freq":
-            # Among results within error tol AND power cap, pick lowest delay
-            power_cap = max_power_mW / 1e3  # convert to watts
+            power_cap = max_power_mW / 1e3
             feasible = [r for r in within_tol if r[1] <= power_cap]
             if feasible:
-                feasible.sort(key=lambda x: x[7])  # sort by delay
+                feasible.sort(key=lambda x: x[7])  # min delay
                 pick = feasible[0]
-                max_f = 1.0 / (pick[7] * self.board.max_logic_depth) if pick[7] > 0 else 0
+                max_f = 1e9 / (pick[7] * self.board.max_logic_depth) if pick[7] > 0 else 0
                 print(f"    Best (max freq, P<{max_power_mW:.0f}mW): "
                       f"R1={pick[2]/1e3:.2f}k R2={pick[3]/1e3:.2f}k "
                       f"R3={pick[4]/1e3:.2f}k "
                       f"err={pick[0]*1e3:.1f}mV P={pick[1]*1e3:.2f}mW "
-                      f"delay={pick[7]*1e9:.0f}ns "
+                      f"delay={pick[7]:.0f}ns "
                       f"max_f={max_f/1e3:.0f}kHz")
             elif within_tol:
-                within_tol.sort(key=lambda x: x[7])  # sort by delay
+                within_tol.sort(key=lambda x: x[7])
                 pick = within_tol[0]
                 print(f"    Best (min delay, power uncapped): "
                       f"R1={pick[2]/1e3:.2f}k R2={pick[3]/1e3:.2f}k "
                       f"R3={pick[4]/1e3:.2f}k "
                       f"err={pick[0]*1e3:.1f}mV P={pick[1]*1e3:.2f}mW "
-                      f"delay={pick[7]*1e9:.0f}ns")
+                      f"delay={pick[7]:.0f}ns")
             else:
                 verified.sort(key=lambda x: x[7])
                 pick = verified[0]
                 print(f"    Best (closest, outside tol): "
-                      f"R1={pick[2]/1e3:.2f}k err={pick[0]*1e3:.1f}mV")
+                      f"err={pick[0]*1e3:.1f}mV delay={pick[7]:.0f}ns")
         else:
-            # min_power mode (original)
-            if within_tol:
-                within_tol.sort(key=lambda x: x[1])  # sort by power
-                pick = within_tol[0]
-                print(f"    Best (min power within {max_error_tol*1e3:.0f}mV): "
+            # min_power: must also meet delay budget
+            if has_delay_nn:
+                feasible = [r for r in within_tol if r[7] <= max_delay_budget]
+            else:
+                feasible = within_tol
+
+            if feasible:
+                feasible.sort(key=lambda x: x[1])  # min power
+                pick = feasible[0]
+                print(f"    Best (min power, err<{max_error_tol*1e3:.0f}mV, "
+                      f"delay<{max_delay_budget:.0f}ns): "
                       f"R1={pick[2]/1e3:.2f}k R2={pick[3]/1e3:.2f}k "
                       f"R3={pick[4]/1e3:.2f}k "
-                      f"err={pick[0]*1e3:.1f}mV P={pick[1]*1e3:.2f}mW")
+                      f"err={pick[0]*1e3:.1f}mV P={pick[1]*1e3:.2f}mW "
+                      f"delay={pick[7]:.0f}ns")
+            elif within_tol:
+                within_tol.sort(key=lambda x: x[1])
+                pick = within_tol[0]
+                print(f"    Best (min power, delay unchecked): "
+                      f"R1={pick[2]/1e3:.2f}k R2={pick[3]/1e3:.2f}k "
+                      f"R3={pick[4]/1e3:.2f}k "
+                      f"err={pick[0]*1e3:.1f}mV P={pick[1]*1e3:.2f}mW "
+                      f"delay={pick[7]:.0f}ns")
             else:
-                verified.sort(key=lambda x: x[0])  # sort by error
+                verified.sort(key=lambda x: x[0])
                 pick = verified[0]
                 print(f"    Best (closest, outside tol): "
-                      f"R1={pick[2]/1e3:.2f}k R2={pick[3]/1e3:.2f}k "
-                      f"R3={pick[4]/1e3:.2f}k "
                       f"err={pick[0]*1e3:.1f}mV P={pick[1]*1e3:.2f}mW")
 
-        max_err, power, r1, r2, r3, v_high, v_low, delay = pick
+        max_err, power, r1, r2, r3, v_high, v_low, delay_ns = pick
 
         total_time = time.time() - t0
         print(f"    Total: {total_time:.2f}s")
@@ -313,7 +318,7 @@ class SurrogateOptimizer:
             v_high=float(v_high), v_low=float(v_low),
             swing=float(v_high - v_low),
             power_mW=float(power * 1e3),
-            delay_ns=float(delay * 1e9),
+            delay_ns=float(delay_ns),
             max_error_mV=float(max_err * 1e3),
             converged=bool(max_err <= max_error_tol),
             f_target=self.board.f_target,
