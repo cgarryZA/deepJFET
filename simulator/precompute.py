@@ -39,8 +39,18 @@ class GateProfile:
     delay_table: dict = field(default_factory=dict) # fan_out -> delay_s
 
 
-def _delay_for_params(params, n_fanout):
-    """Delay estimate using shared model.timing function."""
+def _delay_for_params(params, n_fanout, delay_model=None):
+    """Delay estimate. Uses delay NN if available, else RC estimate."""
+    if delay_model is not None:
+        import numpy as np
+        from nn.delay_model import predict_delay
+        X = np.array([[params.r1, params.r2, params.r3,
+                        params.v_pos, params.v_neg, params.temp_c]], dtype=np.float32)
+        delays = predict_delay(delay_model, X)  # (1, 2) in ns
+        # Scale by fanout (delay NN trained at fanout=4, scale linearly)
+        base_fanout = 4
+        scale = max(n_fanout, 1) / base_fanout
+        return float(delays[0].max()) * scale * 1e-9  # convert ns to seconds
     return estimate_prop_delay(params.r1, params.r2, params.r3,
                                params.caps.cgd0, params.caps.cgs0, n_fanout)
 
@@ -51,6 +61,7 @@ def precompute_gate(
     v_high: float,
     v_low: float,
     max_fanout: int = 10,
+    delay_model=None,
 ) -> GateProfile:
     """Build DC table and delay table for a gate type.
 
@@ -81,10 +92,63 @@ def precompute_gate(
             v_a_low = res["v_a"]
 
     for fo in range(max_fanout + 1):
-        delay = _delay_for_params(params, max(fo, 1))
+        delay = _delay_for_params(params, max(fo, 1), delay_model=delay_model)
         profile.delay_table[fo] = delay
 
     return profile
+
+
+def save_profiles(profiles: dict, path: str):
+    """Save precomputed gate profiles to disk."""
+    import json
+    from pathlib import Path
+    data = {}
+    for gt, prof in profiles.items():
+        key = gt.value if hasattr(gt, 'value') else str(gt)
+        data[key] = {
+            "n_inputs": prof.n_inputs,
+            "v_high": prof.v_high,
+            "v_low": prof.v_low,
+            "dc_table": {str(k): v for k, v in prof.dc_table.items()},
+            "delay_table": {str(k): v for k, v in prof.delay_table.items()},
+            "params": {
+                "v_pos": prof.params.v_pos, "v_neg": prof.params.v_neg,
+                "r1": prof.params.r1, "r2": prof.params.r2, "r3": prof.params.r3,
+                "temp_c": prof.params.temp_c,
+            } if prof.params else None,
+        }
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+    print(f"  Saved {len(profiles)} profiles to {path}")
+
+
+def load_profiles(path: str, jfet=None, caps=None) -> dict:
+    """Load precomputed gate profiles from disk."""
+    import json
+    import ast
+    with open(path) as f:
+        data = json.load(f)
+
+    profiles = {}
+    for key, d in data.items():
+        gt = GateType(key)
+        params = None
+        if d["params"] and jfet and caps:
+            params = CircuitParams(
+                v_pos=d["params"]["v_pos"], v_neg=d["params"]["v_neg"],
+                r1=d["params"]["r1"], r2=d["params"]["r2"], r3=d["params"]["r3"],
+                jfet=jfet, caps=caps, temp_c=d["params"]["temp_c"],
+            )
+        prof = GateProfile(
+            gate_type=gt, n_inputs=d["n_inputs"],
+            v_high=d["v_high"], v_low=d["v_low"], params=params,
+        )
+        prof.dc_table = {ast.literal_eval(k): v for k, v in d["dc_table"].items()}
+        prof.delay_table = {int(k): v for k, v in d["delay_table"].items()}
+        profiles[gt] = prof
+    print(f"  Loaded {len(profiles)} profiles from {path}")
+    return profiles
 
 
 def precompute_from_designs(
@@ -168,6 +232,7 @@ def profile_custom_gate(
     v_high: float,
     v_low: float,
     max_fanout: int = 10,
+    delay_model=None,
 ) -> GateProfile:
     """Profile a custom (Tier 2) gate using an arbitrary solver function."""
     profile = GateProfile(
@@ -191,7 +256,7 @@ def profile_custom_gate(
             v_a_low = res["v_a"]
 
     for fo in range(max_fanout + 1):
-        delay = _delay_for_params(params, max(fo, 1))
+        delay = _delay_for_params(params, max(fo, 1), delay_model=delay_model)
         profile.delay_table[fo] = delay
 
     return profile
