@@ -10,8 +10,15 @@ from .jfet import (
 )
 from .gate import (
     GateType, gate_input_count,
-    solve_gate, solve_nor, solve_nand, solve_any_gate,
+    solve_gate, solve_nor, solve_nand, solve_any_gate, solve_network,
     sweep,
+)
+from .network import (
+    Leaf, Series, Parallel, PulldownNetwork,
+    count_midpoints, count_jfets, input_names, n_solver_vars,
+    canonical_str, to_dict, from_dict,
+    network_truth_table, gate_type_to_network,
+    network_current, network_current_with_gate,
 )
 from .capacitance import JFETCapacitance
 from .timing import max_r_out_for_freq, estimate_prop_delay

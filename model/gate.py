@@ -289,7 +289,113 @@ def solve_any_gate(
     if gate_type in (GateType.NAND2, GateType.NAND3, GateType.NAND4):
         return solve_nand(v_ins, v_pos, v_neg, r1, r2, r3, j1, j2, temp_c)
 
+    if gate_type == GateType.CUSTOM:
+        raise ValueError("Use solve_network() for CUSTOM gate types")
+
     raise ValueError(f"Unsupported gate type: {gate_type}")
+
+
+# ---------------------------------------------------------------------------
+# Generic network solver (arbitrary series/parallel topology)
+# ---------------------------------------------------------------------------
+
+def solve_network(
+    network,
+    v_ins_dict: dict,
+    v_pos: float, v_neg: float,
+    r1: float, r2: float, r3: float,
+    j1: NChannelJFET, j2: NChannelJFET,
+    temp_c: float = 27.0,
+) -> dict:
+    """Solve a gate with arbitrary pull-down network topology.
+
+    Args:
+        network: PulldownNetwork (Leaf, Series, or Parallel)
+        v_ins_dict: dict of input_name -> voltage
+        v_pos, v_neg: supply rails
+        r1, r2, r3: resistors
+        j1, j2: JFET models (all J1s identical)
+        temp_c: temperature
+
+    Returns dict with v_a, v_b, v_out, v_mids, currents, etc.
+    """
+    from .network import (
+        count_midpoints, network_current_with_gate,
+        network_current,
+    )
+
+    r_load = r2 + r3
+    vt = thermal_voltage(temp_c + 273.15)
+    n_mids = count_midpoints(network)
+    n_vars = 2 + n_mids  # v_a, v_b, midpoints
+
+    def equations(x):
+        v_a = x[0]
+        v_b = x[1]
+        mids_list = list(x[2:])
+
+        # J1 network current + gate-drain current of topmost JFET
+        residuals = []
+        mids_copy = list(mids_list)
+        i_j1, igd_j1 = network_current_with_gate(
+            network, v_a, 0.0, v_ins_dict, j1,
+            jfet_ids, jfet_gate_current, vt,
+            mids_copy, residuals,
+        )
+
+        # J2 (load transistor) — same for all topologies
+        vgs2 = v_a - v_b
+        vds2 = v_pos - v_b
+        i_j2 = jfet_ids(vgs=vgs2, vds=vds2, j=j2)
+        vgs2_int = v_a - (v_b + i_j2 * j2.rs)
+        vgd2_int = v_a - (v_pos - i_j2 * j2.rd)
+        igs_j2, igd_j2 = jfet_gate_current(vgs2_int, vgd2_int, j2, vt)
+
+        # KCL at Node A
+        eq_a = (v_pos - v_a) / r1 + igd_j1 - i_j1 - (igs_j2 + igd_j2)
+        # KCL at Node B
+        eq_b = i_j2 + igs_j2 - (v_b - v_neg) / r_load
+
+        return [eq_a, eq_b] + residuals
+
+    # Try multiple initial guesses
+    best = None
+    for v_a_g, v_b_g in [(5.0, 3.0), (v_pos / 2.0, 0.0), (1.0, -1.0), (10.0, 5.0)]:
+        mids_g = [v_a_g * (n_mids - k) / max(n_mids, 1)
+                  for k in range(n_mids)]
+        guess = [v_a_g, v_b_g] + mids_g
+        sol, info, ier, msg = fsolve(equations, guess, full_output=True,
+                                      maxfev=200)
+        if ier == 1:
+            best = sol
+            break
+    if best is None:
+        best = sol
+
+    v_a = best[0]
+    v_b = best[1]
+    v_mids = list(best[2:2 + n_mids])
+
+    # Extract results
+    mids_copy = list(v_mids)
+    residuals = []
+    i_j1 = network_current(network, v_a, 0.0, v_ins_dict, j1,
+                           jfet_ids, mids_copy, residuals)
+
+    vgs2 = v_a - v_b
+    vds2 = v_pos - v_b
+    i_j2 = jfet_ids(vgs=vgs2, vds=vds2, j=j2)
+    i_r1 = (v_pos - v_a) / r1
+    i_load = (v_b - v_neg) / r_load
+    v_out = v_neg + i_load * r3
+
+    return {
+        "v_ins": v_ins_dict, "v_a": v_a, "v_b": v_b, "v_out": v_out,
+        "v_mids": v_mids,
+        "i_r1_mA": i_r1 * 1e3, "i_j1_mA": i_j1 * 1e3,
+        "i_j2_mA": i_j2 * 1e3, "i_load_mA": i_load * 1e3,
+        "j2_region": region_name(vgs2, vds2, j2),
+    }
 
 
 # ---------------------------------------------------------------------------
