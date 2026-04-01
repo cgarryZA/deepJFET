@@ -23,6 +23,14 @@ NJF_GATE = (0, 64)
 RES_TOP = (16, 0)
 RES_BOT = (16, 80)
 
+# Supply source position (must be on 16-grid)
+SUPPLY_X = -496
+
+
+def _grid(v):
+    """Snap to 16-unit grid."""
+    return round(v / 16) * 16
+
 
 class _LayoutState:
     def __init__(self):
@@ -238,23 +246,25 @@ def export_netlist_asc(
                            gate.inputs, gate.output, jfet_model)
 
         ls.lines.append(f"TEXT {x_pos-48} -104 Left 2 ;{gname} ({gate.gate_type.value})")
-        x_pos += width + 100
+        # Pitch must be multiple of 96 to keep all children on 16-grid
+        pitch = ((width + 144) // 96 + 1) * 96
+        x_pos += pitch
 
     # Supplies
-    sx = -500
+    sx = SUPPLY_X
     ls.flag(sx, 16, "VDD")
     ls.flag(sx, 96, "0")
     ls.lines.append(f"SYMBOL voltage {sx} 0 R0")
     ls.lines.append(f"SYMATTR InstName V_VDD")
     ls.lines.append(f"SYMATTR Value {v_pos}")
-    ls.flag(sx, 216, "VSS")
-    ls.flag(sx, 296, "0")
-    ls.lines.append(f"SYMBOL voltage {sx} 200 R0")
+    ls.flag(sx, 208, "VSS")
+    ls.flag(sx, 304, "0")
+    ls.lines.append(f"SYMBOL voltage {sx} 192 R0")
     ls.lines.append(f"SYMATTR InstName V_VSS")
     ls.lines.append(f"SYMATTR Value {v_neg}")
 
     if stimuli:
-        stim_y = 500
+        stim_y = 496
         for net_name, stim in stimuli.items():
             if isinstance(stim, dict):
                 v1 = stim.get("v1", -4.0)
@@ -272,7 +282,7 @@ def export_netlist_asc(
             ls.lines.append(f"SYMBOL voltage {sx} {stim_y} R0")
             ls.lines.append(f"SYMATTR InstName V_{net_name}")
             ls.lines.append(f"SYMATTR Value {val}")
-            stim_y += 200
+            stim_y += 192
 
     if jfet_model_card is None:
         jfet_model_card = (
