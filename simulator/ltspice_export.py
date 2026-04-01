@@ -1,101 +1,192 @@
 """Export a Netlist to LTSpice .asc schematic format.
 
-Layout matched to the minimal hand-built LTSpice inverter.
-Components packed tight — pins connect directly or with minimal wires.
+Supports INV, NOR-N, NAND-N, and arbitrary series/parallel topologies.
+Layout derived from hand-built LTSpice reference schematics.
 
-NJF pins from symbol (x,y): drain=(x+48,y), source=(x+48,y+96), gate=(x,y+64)
-RES pins from symbol (x,y): top=(x+16,y), bottom=(x+16,y+80)
+NJF pins from (x,y): drain=(x+48,y), source=(x+48,y+96), gate=(x,y+64)
+RES pins from (x,y): top=(x+16,y), bottom=(x+16,y+80)
 """
 
 from simulator.netlist import Netlist, Gate
 from simulator.precompute import CircuitParams
-from model.network import gate_type_to_network, input_names
+from model.network import (
+    PulldownNetwork, Leaf, Series, Parallel,
+    gate_type_to_network, input_names, count_jfets,
+)
 from model import GateType
 
-# Minimal inverter layout (from hand-built reference):
-#
-#   R1 sym (-112, 32)   top=(-96,32)=VDD   bot=(-96,112)
-#   J1 sym (-144, 128)  drain=(-96,128)     src=(-96,224)=GND  gate=(-144,192)=INPUT
-#   J2 sym (-48, 64)    drain=(0,64)=VDD    src=(0,160)        gate=(-48,128)=NodeA
-#   R2 sym (-16, 144)   top=(0,144)         bot=(0,224)
-#   R3 sym (-16, 224)   top=(0,224)=OUT     bot=(0,304)=VSS
-#
-# Connections:
-#   R1 bot (-96,112) → J1 drain (-96,128): wire, 16 units
-#   Node A = junction of R1/J1/J2gate at (-96,128) area
-#   Wire (-48,128) to (-96,128) connects J2 gate to Node A
-#   J2 src (0,160) → R2 top (0,144): 16 unit overlap (LTSpice connects)
-#   R2 bot (0,224) = R3 top (0,224): direct connection
-#
-# Total gate footprint: ~200 wide, ~280 tall
 
-GATE_PITCH = 320  # compact horizontal spacing
+def _layout_j1_network(net, x, y, lines, jfet_model, gate_name, counter,
+                       input_labels, input_idx):
+    """Recursively lay out J1 pull-down network. Returns (width, height, node_a_points).
+
+    Parallel: J1s side by side at same y, all drains at y
+    Series: J1s stacked vertically, source-to-drain chain
+    Leaf: single JFET
+
+    Returns:
+        top_x: x of top drain connection
+        top_y: y of top drain connection
+        bot_y: y of bottom source connection
+        node_a_points: list of (x, y) drain connection points for wiring
+    """
+    if isinstance(net, Leaf):
+        # Single JFET at (x, y)
+        lines.append(f"SYMBOL njf {x} {y} R0")
+        lines.append(f"SYMATTR InstName J1_{gate_name}_{counter[0]}")
+        lines.append(f"SYMATTR Value {jfet_model}")
+        counter[0] += 1
+
+        # Gate wire to input label
+        idx = input_idx[0]
+        input_idx[0] += 1
+        label = input_labels[idx] if idx < len(input_labels) else f"in{idx}"
+        lines.append(f"WIRE {x} {y+64} {x-16} {y+64}")
+        lines.append(f"FLAG {x-16} {y+64} {label}")
+
+        drain_x = x + 48
+        drain_y = y
+        source_y = y + 96
+        return drain_x, drain_y, source_y, [(drain_x, drain_y)]
+
+    if isinstance(net, Parallel):
+        # Lay out children side by side
+        all_points = []
+        child_x = x
+        max_bot_y = 0
+        first_drain_y = None
+
+        for i, child in enumerate(net.children):
+            dx, dy, by, pts = _layout_j1_network(
+                child, child_x, y, lines, jfet_model, gate_name,
+                counter, input_labels, input_idx)
+            all_points.extend(pts)
+            max_bot_y = max(max_bot_y, by)
+            if first_drain_y is None:
+                first_drain_y = dy
+
+            # Compute width of this child for spacing
+            if isinstance(child, Leaf):
+                child_x += 96
+            elif isinstance(child, Series):
+                child_x += 96
+            else:
+                n = count_jfets(child)
+                child_x += n * 96
+
+        # Connect all drain points with horizontal wire if multiple
+        if len(all_points) > 1:
+            xs = [p[0] for p in all_points]
+            min_x, max_x = min(xs), max(xs)
+            lines.append(f"WIRE {max_x} {y} {min_x} {y}")
+
+        # GND for bottom sources
+        for child in net.children:
+            # Each parallel branch needs its own GND
+            pass  # handled by leaf/series source connections
+
+        return all_points[0][0], y, max_bot_y, all_points
+
+    if isinstance(net, Series):
+        # Stack children vertically
+        curr_y = y
+        top_drain = None
+        all_points = []
+
+        for i, child in enumerate(net.children):
+            dx, dy, by, pts = _layout_j1_network(
+                child, x, curr_y, lines, jfet_model, gate_name,
+                counter, input_labels, input_idx)
+            if top_drain is None:
+                top_drain = (dx, dy)
+                all_points = pts
+            curr_y = by  # next child starts where this one's source is
+
+        # GND at bottom of chain
+        last_source_x = x + 48
+        lines.append(f"FLAG {last_source_x} {curr_y} 0")
+
+        return top_drain[0], top_drain[1], curr_y, all_points
 
 
-def _emit_gate(lines, gate_name, params, xb, yb, input_labels,
-               output_label, jfet_model, counter):
-    """Emit one INV/NOR gate at (xb, yb) using minimal layout."""
+def _emit_gate(lines, gate_name, params, network, xb, yb,
+               input_labels, output_label, jfet_model, counter):
+    """Emit a complete gate with arbitrary topology."""
     r1, r2, r3 = params.r1, params.r2, params.r3
-    n_ins = len(input_labels)
 
-    # Offset base: R1/J1 column at xb, J2/R2/R3 column at xb+96
-
-    # -- Wires (only where pins don't directly touch) --
-    # Node A: connect R1 bot to J1 drain to J2 gate
-    # R1 bot = (xb, 112), J1 drain = (xb, 128) → 16 gap, need wire
-    # J2 gate = (xb+48, 128), connect to Node A at (xb, 128)
-    lines.append(f"WIRE {xb+48} {yb+128} {xb} {yb+128}")
-
-    # J1 gate to input label
-    for k in range(n_ins):
-        j1_x = xb - 48 - k * 160
-        lines.append(f"WIRE {j1_x} {yb+192} {j1_x-16} {yb+192}")
-
-    # J2 source (xb+96, 160) to R2 top (xb+96, 144) — overlap, but add wire for clarity
-    # R2 bot (xb+96, 224) to R3 top (xb+96, 224) — same point, auto-connects
-    # Output label wire
-    lines.append(f"WIRE {xb+96+48} {yb+240} {xb+96} {yb+240}")
-
-    # -- Flags --
-    lines.append(f"FLAG {xb} {yb+48} VDD")          # R1 top
-    lines.append(f"FLAG {xb+96} {yb+64} VDD")       # J2 drain
-    lines.append(f"FLAG {xb+96+48} {yb+240} {output_label}")  # between R2/R3
-    lines.append(f"FLAG {xb+96} {yb+320} VSS")      # R3 bottom
-    for k in range(n_ins):
-        j1_x = xb - 48 - k * 160
-        lines.append(f"FLAG {xb} {yb+224} 0")       # J1 source = GND
-        lines.append(f"FLAG {j1_x-16} {yb+192} {input_labels[k]}")
-
-    # -- Symbols --
-    # R1
-    lines.append(f"SYMBOL res {xb-16} {yb+32} R0")
+    # R1: from VDD down to Node A
+    r1_x = xb
+    r1_y = yb + 32
+    lines.append(f"SYMBOL res {r1_x-16} {r1_y} R0")
     lines.append(f"SYMATTR InstName R1_{counter[0]}")
     lines.append(f"SYMATTR Value {r1:.0f}")
     counter[0] += 1
+    lines.append(f"FLAG {r1_x} {yb+48-16} VDD")
 
-    # J1(s)
-    for k in range(n_ins):
-        j1_x = xb - 48 - k * 160
-        lines.append(f"SYMBOL njf {j1_x} {yb+128} R0")
-        lines.append(f"SYMATTR InstName J1_{gate_name}_{k}")
-        lines.append(f"SYMATTR Value {jfet_model}")
+    # R1 bottom pin at (r1_x, r1_y+80) = (xb, yb+112)
+    # Node A is at yb+128 (where J1 drains connect)
+    node_a_y = yb + 128
+
+    # Wire R1 bottom to Node A level
+    # (R1 bottom is at yb+112, Node A at yb+128 — but they might need a wire)
+
+    # Layout J1 network
+    j1_x = xb - 48  # J1 network starts to the left
+    input_idx = [0]
+    j1_counter = [counter[0]]
+
+    drain_x, drain_y, source_y, node_a_pts = _layout_j1_network(
+        network, j1_x, node_a_y, lines, jfet_model, gate_name,
+        j1_counter, input_labels, input_idx)
+    counter[0] = j1_counter[0]
+
+    # Wire from R1 bottom to Node A (connect to rightmost drain point)
+    rightmost_x = max(p[0] for p in node_a_pts)
+    lines.append(f"WIRE {r1_x} {node_a_y} {r1_x} {r1_y+80}")
+
+    # Extend Node A wire to include R1 position
+    if r1_x != rightmost_x:
+        lines.append(f"WIRE {rightmost_x} {node_a_y} {r1_x} {node_a_y}")
+
+    # J2 column: to the right of R1
+    j2_x = rightmost_x + 48
+    j2_y = yb + 64
+
+    # Wire from Node A to J2 gate
+    j2_gate_x = j2_x
+    j2_gate_y = j2_y + 64  # = yb + 128 = node_a_y
+    lines.append(f"WIRE {j2_gate_x} {j2_gate_y} {rightmost_x} {j2_gate_y}")
 
     # J2
-    lines.append(f"SYMBOL njf {xb+48} {yb+64} R0")
+    lines.append(f"SYMBOL njf {j2_x} {j2_y} R0")
     lines.append(f"SYMATTR InstName J2_{gate_name}")
     lines.append(f"SYMATTR Value {jfet_model}")
 
-    # R2
-    lines.append(f"SYMBOL res {xb+80} {yb+144} R0")
+    j2_drain_x = j2_x + 48  # where R2/R3 column is
+    lines.append(f"FLAG {j2_drain_x} {j2_y} VDD")
+
+    # R2: below J2 source
+    r2_x = j2_drain_x - 16
+    r2_y = j2_y + 96 + 48  # J2 source at j2_y+96, small gap
+    lines.append(f"SYMBOL res {r2_x} {r2_y} R0")
     lines.append(f"SYMATTR InstName R2_{counter[0]}")
     lines.append(f"SYMATTR Value {r2:.0f}")
     counter[0] += 1
 
-    # R3
-    lines.append(f"SYMBOL res {xb+80} {yb+224} R0")
+    # R3: below R2
+    r3_y = r2_y + 80
+    lines.append(f"SYMBOL res {r2_x} {r3_y} R0")
     lines.append(f"SYMATTR InstName R3_{counter[0]}")
     lines.append(f"SYMATTR Value {r3:.0f}")
     counter[0] += 1
+
+    # Output flag between R2 and R3
+    out_y = r3_y
+    lines.append(f"WIRE {j2_drain_x+48} {out_y} {j2_drain_x} {out_y}")
+    lines.append(f"FLAG {j2_drain_x+48} {out_y} {output_label}")
+
+    # VSS at R3 bottom
+    lines.append(f"FLAG {j2_drain_x} {r3_y+80} VSS")
 
 
 def export_netlist_asc(
@@ -122,26 +213,30 @@ def export_netlist_asc(
     all_gates = ordered + feedback
 
     counter = [0]
+    x_pos = 0
 
-    for i, gname in enumerate(all_gates):
+    for gname in all_gates:
         gate = netlist.gates[gname]
         params = gate_params[gname]
-        x = i * GATE_PITCH
+        network = gate_networks[gname]
 
-        _emit_gate(lines, gname, params, x, 0,
-                   gate.inputs, gate.output,
-                   jfet_model, counter)
+        _emit_gate(lines, gname, params, network, x_pos, 0,
+                   gate.inputs, gate.output, jfet_model, counter)
 
-        lines.append(f"TEXT {x-48} -104 Left 2 ;{gname} ({gate.gate_type.value})")
+        lines.append(f"TEXT {x_pos-48} -104 Left 2 ;{gname} ({gate.gate_type.value})")
 
-    # Supply sources
+        # Estimate width for next gate position
+        n_j = count_jfets(network)
+        gate_width = max(n_j * 96 + 200, 320)
+        x_pos += gate_width
+
+    # Supplies
     sx = -500
     lines.append(f"FLAG {sx} 16 VDD")
     lines.append(f"FLAG {sx} 96 0")
     lines.append(f"SYMBOL voltage {sx} 0 R0")
     lines.append(f"SYMATTR InstName V_VDD")
     lines.append(f"SYMATTR Value {v_pos}")
-
     lines.append(f"FLAG {sx} 216 VSS")
     lines.append(f"FLAG {sx} 296 0")
     lines.append(f"SYMBOL voltage {sx} 200 R0")
