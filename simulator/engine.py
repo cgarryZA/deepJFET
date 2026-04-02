@@ -135,6 +135,42 @@ class SimulationEngine:
                 source="stimulus",
             ))
 
+    def force_evaluate_all(self):
+        """Evaluate every gate once in topological order.
+
+        This establishes consistent initial state for all gates, including
+        those whose inputs are constant (which the event-driven sim would
+        otherwise never evaluate). Call after setting initial net values
+        and before running the simulation.
+        """
+        ordered, feedback = self.netlist.topological_sort()
+        # Evaluate ordered gates first, then feedback gates
+        all_gates = ordered + feedback
+        for gate_name in all_gates:
+            gate = self.netlist.gates[gate_name]
+            new_val, new_voltage = self._evaluate_gate(gate)
+            ns = self._nets[gate.output]
+            changed = (ns.value != new_val)
+            ns.value = new_val
+            ns.voltage = new_voltage
+            ns.history.append((0.0, new_val, new_voltage))
+            # If output changed, schedule downstream gates
+            if changed:
+                out_net = self.netlist.nets[gate.output]
+                for load_name in out_net.loads:
+                    load_gate = self.netlist.gates[load_name]
+                    delay = self._get_delay(load_gate)
+                    self._schedule_gate_eval(load_name, delay)
+
+        # Run a few iterations for feedback gates to settle
+        for _ in range(3):
+            for gate_name in feedback:
+                gate = self.netlist.gates[gate_name]
+                new_val, new_voltage = self._evaluate_gate(gate)
+                ns = self._nets[gate.output]
+                ns.value = new_val
+                ns.voltage = new_voltage
+
     def set_initial_state(self, net_values: dict):
         """Set initial net values before simulation."""
         for name, val in net_values.items():

@@ -306,42 +306,78 @@ class CPU:
                                   auto_precompute_params=self.params_inv)
         pi = netlist.primary_inputs
 
-        # Phase 0: Initialize — toggle all inputs HIGH then LOW to establish state
-        # Then clock all registers to latch 0
-        t_init = 0
+        # Phase 0: Power-on reset
+        # Set all primary inputs to LOW
         for sig in pi:
-            engine.add_stimulus(Stimulus(sig, [t_init], [True]))
+            engine._nets[sig].value = False
+            engine._nets[sig].voltage = V_LOW
 
-        t_init2 = 1e-6
-        for sig in pi:
-            engine.add_stimulus(Stimulus(sig, [t_init2], [False]))
+        # Force all register Q outputs to LOW and Q_bar to HIGH
+        # This is the async reset — directly setting latch state
+        for prefix in ['ACC', 'BREG', 'R0']:
+            for bit in range(n):
+                q_net = f'{prefix}_{bit}'
+                qb_net = f'{prefix}_{bit}_bar'
+                if q_net in engine._nets:
+                    engine._nets[q_net].value = False
+                    engine._nets[q_net].voltage = V_LOW
+                    engine._nets[q_net].history = [(0, False, V_LOW)]
+                if qb_net in engine._nets:
+                    engine._nets[qb_net].value = True
+                    engine._nets[qb_net].voltage = V_HIGH
+                    engine._nets[qb_net].history = [(0, True, V_HIGH)]
 
-        # Set all register D inputs to LOW and clock to latch zeros
-        for prefix in ['ACC', 'BREG', 'R0', 'IR', 'PC']:
-            if prefix == 'IR':
-                for bit in range(8):
-                    engine.add_stimulus(Stimulus(f'IR_{bit}_In', [2e-6], [False]))
-            elif prefix == 'PC':
-                for bit in range(n):
-                    engine.add_stimulus(Stimulus(f'PC_{bit}_In', [2e-6], [False]))
-            else:
-                for bit in range(n):
-                    engine.add_stimulus(Stimulus(f'{prefix}_{bit}_In', [2e-6], [False]))
+        # IR register
+        for bit in range(8):
+            q_net = f'IR_{bit}'
+            qb_net = f'IR_{bit}_bar'
+            if q_net in engine._nets:
+                engine._nets[q_net].value = False
+                engine._nets[q_net].voltage = V_LOW
+                engine._nets[q_net].history = [(0, False, V_LOW)]
+            if qb_net in engine._nets:
+                engine._nets[qb_net].value = True
+                engine._nets[qb_net].voltage = V_HIGH
+                engine._nets[qb_net].history = [(0, True, V_HIGH)]
 
-        # Enable all registers and clock
+        # PC register
+        for bit in range(n):
+            q_net = f'PC_{bit}'
+            qb_net = f'PC_{bit}_bar'
+            if q_net in engine._nets:
+                engine._nets[q_net].value = False
+                engine._nets[q_net].voltage = V_LOW
+                engine._nets[q_net].history = [(0, False, V_LOW)]
+            if qb_net in engine._nets:
+                engine._nets[qb_net].value = True
+                engine._nets[qb_net].voltage = V_HIGH
+                engine._nets[qb_net].history = [(0, True, V_HIGH)]
+
+        # Force-evaluate all combinational gates with the reset state
+        engine.force_evaluate_all()
+
+        # Set all control signals to initial LOW state
+        for sig in ALL_CONTROL_SIGNALS:
+            if sig in pi:
+                engine.add_stimulus(Stimulus(sig, [0], [False]))
+        if 'ALU_B_IS_ONE' in pi:
+            engine.add_stimulus(Stimulus('ALU_B_IS_ONE', [0], [False]))
+        engine.add_stimulus(Stimulus('SUB', [0], [False]))
+        engine.add_stimulus(Stimulus('INC', [0], [False]))
+        engine.add_stimulus(Stimulus('LOAD', [0], [False]))
+        engine.add_stimulus(Stimulus('CLK', [0], [False]))
         for en in ['ACC_Enable', 'BREG_Enable', 'R0_Enable', 'IR_Enable', 'PC_Enable']:
             if en in pi:
-                engine.add_stimulus(Stimulus(en, [2e-6], [True]))
-        engine.add_stimulus(Stimulus('CLK', [2e-6, 3.5e-6], [True, False]))
-        engine.add_stimulus(Stimulus('INC', [2e-6], [False]))
-        engine.add_stimulus(Stimulus('LOAD', [2e-6], [False]))
+                engine.add_stimulus(Stimulus(en, [0], [False]))
+        for bit in range(n):
+            for prefix in ['ACC', 'BREG', 'R0']:
+                if f'{prefix}_{bit}_In' in pi:
+                    engine.add_stimulus(Stimulus(f'{prefix}_{bit}_In', [0], [False]))
+        for bit in range(8):
+            engine.add_stimulus(Stimulus(f'IR_{bit}_In', [0], [False]))
 
-        # Disable enables after init clock
-        for en in ['ACC_Enable', 'BREG_Enable', 'R0_Enable', 'IR_Enable']:
-            if en in pi:
-                engine.add_stimulus(Stimulus(en, [4e-6], [False]))
-
-        engine.run(4.5e-6)
+        engine.run(1e-6)
+        engine.force_evaluate_all()
 
         # Now start executing instructions
         t_current = 5e-6  # start after init settles
@@ -400,13 +436,23 @@ class CPU:
                 engine.add_stimulus(Stimulus('SUB', [t_current],
                                              ['ALU_SUB' in active]))
 
-                # Register enables from active signals
+                # Register enables — assert briefly at end of CLK-HIGH phase
+                # to prevent transparent-latch feedback race
+                t_enable = t_current + T_STEP * 0.4  # late in CLK-HIGH
+                t_disable = t_current + T_STEP * 0.48  # before CLK falls
+
                 acc_en = 'ACC_LOAD_FROM_ALU' in active or 'ACC_LOAD_FROM_BUS' in active
-                engine.add_stimulus(Stimulus('ACC_Enable', [t_current], [acc_en]))
+                engine.add_stimulus(Stimulus('ACC_Enable',
+                                             [t_current, t_enable, t_disable],
+                                             [False, acc_en, False]))
                 breg_en = 'BREG_LOAD_FROM_BUS' in active
-                engine.add_stimulus(Stimulus('BREG_Enable', [t_current], [breg_en]))
+                engine.add_stimulus(Stimulus('BREG_Enable',
+                                             [t_current, t_enable, t_disable],
+                                             [False, breg_en, False]))
                 r0_en = 'R0_LOAD_FROM_BUS' in active
-                engine.add_stimulus(Stimulus('R0_Enable', [t_current], [r0_en]))
+                engine.add_stimulus(Stimulus('R0_Enable',
+                                             [t_current, t_enable, t_disable],
+                                             [False, r0_en, False]))
 
                 # PC control — INC during CLK-low phase
                 pc_inc = 'PC_INC' in active
