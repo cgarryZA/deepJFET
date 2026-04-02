@@ -289,7 +289,7 @@ class CPU:
         """
         V_HIGH, V_LOW = -0.8, -4.0
         n = self.n_bits
-        T_STEP = 10e-6  # time per micro-step
+        T_STEP = 50e-6  # time per micro-step (enough for ALU to settle through carry chain)
 
         # Build netlist once
         outputs = set()
@@ -401,13 +401,31 @@ class CPU:
                 print(f"  [{inst_num:3d}] PC={pc:2d} [{opcode:02X}] {inst_name:4s}  "
                       f"ACC={acc:2d} C={carry} R0={r0:2d}", end="")
 
-            # Load IR with opcode (no CLK cycle — just set the data)
+            # Load IR with opcode: set data, then clock IR to latch
             for bit in range(8):
                 bv = bool((opcode >> bit) & 1)
                 engine.add_stimulus(Stimulus(f'IR_{bit}_In', [t_current], [bv]))
             engine.add_stimulus(Stimulus('IR_Enable', [t_current], [True]))
-            # Let IR data settle without clocking
-            t_current += T_STEP / 4
+            # Disable ACC/BREG/R0 during IR load to prevent accidental latching
+            engine.add_stimulus(Stimulus('ACC_Enable', [t_current], [False]))
+            engine.add_stimulus(Stimulus('BREG_Enable', [t_current], [False]))
+            engine.add_stimulus(Stimulus('R0_Enable', [t_current], [False]))
+            # All control signals LOW during fetch
+            for sig in ALL_CONTROL_SIGNALS:
+                if sig in pi:
+                    engine.add_stimulus(Stimulus(sig, [t_current], [False]))
+            engine.add_stimulus(Stimulus('INC', [t_current], [False]))
+            engine.add_stimulus(Stimulus('LOAD', [t_current], [False]))
+            if 'ALU_B_IS_ONE' in pi:
+                engine.add_stimulus(Stimulus('ALU_B_IS_ONE', [t_current], [False]))
+
+            # Clock IR: setup, rise, fall
+            t_ir_rise = t_current + T_STEP / 4
+            t_ir_fall = t_current + T_STEP / 2
+            engine.add_stimulus(Stimulus('CLK',
+                                         [t_current, t_ir_rise, t_ir_fall],
+                                         [False, True, False]))
+            t_current += T_STEP
             engine.run(t_current)
 
             # Execute each micro-step
@@ -436,36 +454,28 @@ class CPU:
                 engine.add_stimulus(Stimulus('SUB', [t_current],
                                              ['ALU_SUB' in active]))
 
-                # Register enables — assert briefly at end of CLK-HIGH phase
-                # to prevent transparent-latch feedback race
-                t_enable = t_current + T_STEP * 0.4  # late in CLK-HIGH
-                t_disable = t_current + T_STEP * 0.48  # before CLK falls
-
+                # Register enables — set up BEFORE clock edge (edge-triggered, no race)
                 acc_en = 'ACC_LOAD_FROM_ALU' in active or 'ACC_LOAD_FROM_BUS' in active
-                engine.add_stimulus(Stimulus('ACC_Enable',
-                                             [t_current, t_enable, t_disable],
-                                             [False, acc_en, False]))
+                engine.add_stimulus(Stimulus('ACC_Enable', [t_current], [acc_en]))
                 breg_en = 'BREG_LOAD_FROM_BUS' in active
-                engine.add_stimulus(Stimulus('BREG_Enable',
-                                             [t_current, t_enable, t_disable],
-                                             [False, breg_en, False]))
+                engine.add_stimulus(Stimulus('BREG_Enable', [t_current], [breg_en]))
                 r0_en = 'R0_LOAD_FROM_BUS' in active
-                engine.add_stimulus(Stimulus('R0_Enable',
-                                             [t_current, t_enable, t_disable],
-                                             [False, r0_en, False]))
+                engine.add_stimulus(Stimulus('R0_Enable', [t_current], [r0_en]))
 
-                # PC control — INC during CLK-low phase
+                # PC control — set up before clock edge
                 pc_inc = 'PC_INC' in active
                 pc_load = 'PC_LOAD' in active
-                engine.add_stimulus(Stimulus('INC',
-                                             [t_current, t_current + T_STEP/2],
-                                             [False, pc_inc]))
+                engine.add_stimulus(Stimulus('INC', [t_current], [pc_inc]))
                 engine.add_stimulus(Stimulus('LOAD', [t_current], [pc_load]))
+                engine.add_stimulus(Stimulus('PC_Enable', [t_current], [True]))
 
-                # CLK: high for first half, low for second half
+                # CLK: setup time, then rising edge, then falling edge
+                # Control signals set at t_current, CLK rises T_STEP/4 later
+                t_rise = t_current + T_STEP / 4  # rising edge after setup
+                t_fall = t_current + T_STEP * 3 / 4  # falling edge
                 engine.add_stimulus(Stimulus('CLK',
-                                             [t_current, t_current + T_STEP/2],
-                                             [True, False]))
+                                             [t_current, t_rise, t_fall],
+                                             [False, True, False]))
 
                 t_current += T_STEP
                 engine.run(t_current)
