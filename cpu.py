@@ -281,27 +281,81 @@ class CPU:
         self.rom = program
 
     def run(self, n_instructions=20, verbose=True):
-        """Execute program. Behavioral sequencer drives gate-level datapath.
+        """Execute program through gate-level datapath with continuous simulation.
 
-        The sequencer is behavioral (Python) but drives REAL gate-level
-        evaluation through the event simulator. The ALU, registers, bus muxes
-        are all real NAND/INV gates. ROM is behavioral.
-
-        Each instruction is executed in its micro-steps. Between steps,
-        the sequencer reads back gate outputs and updates inputs for the
-        next step.
+        Builds the netlist ONCE, then runs the event-driven simulator
+        continuously, injecting stimuli at the right times for each
+        micro-step. Gate state persists across all instructions.
         """
         V_HIGH, V_LOW = -0.8, -4.0
         n = self.n_bits
+        T_STEP = 10e-6  # time per micro-step
 
-        acc = 0
-        carry = 0
-        r0 = 0
-        breg = 0
-        pc = 0
+        # Build netlist once
+        outputs = set()
+        for prefix in ['ACC', 'R0', 'BREG', 'PC']:
+            for bit in range(n):
+                outputs.add(f'{prefix}_{bit}')
+        outputs.update(['CARRY_4', 'FLAG_ZERO'] +
+                       [f'OUT_{bit}' for bit in range(n)] +
+                       [f'BUS_{bit}' for bit in range(n)])
+
+        netlist = Netlist.from_gates(self.gates, primary_outputs=outputs)
+        engine = SimulationEngine(netlist, self.profiles,
+                                  v_high=V_HIGH, v_low=V_LOW,
+                                  auto_precompute_params=self.params_inv)
+        pi = netlist.primary_inputs
+
+        # Phase 0: Initialize — toggle all inputs HIGH then LOW to establish state
+        # Then clock all registers to latch 0
+        t_init = 0
+        for sig in pi:
+            engine.add_stimulus(Stimulus(sig, [t_init], [True]))
+
+        t_init2 = 1e-6
+        for sig in pi:
+            engine.add_stimulus(Stimulus(sig, [t_init2], [False]))
+
+        # Set all register D inputs to LOW and clock to latch zeros
+        for prefix in ['ACC', 'BREG', 'R0', 'IR', 'PC']:
+            if prefix == 'IR':
+                for bit in range(8):
+                    engine.add_stimulus(Stimulus(f'IR_{bit}_In', [2e-6], [False]))
+            elif prefix == 'PC':
+                for bit in range(n):
+                    engine.add_stimulus(Stimulus(f'PC_{bit}_In', [2e-6], [False]))
+            else:
+                for bit in range(n):
+                    engine.add_stimulus(Stimulus(f'{prefix}_{bit}_In', [2e-6], [False]))
+
+        # Enable all registers and clock
+        for en in ['ACC_Enable', 'BREG_Enable', 'R0_Enable', 'IR_Enable', 'PC_Enable']:
+            if en in pi:
+                engine.add_stimulus(Stimulus(en, [2e-6], [True]))
+        engine.add_stimulus(Stimulus('CLK', [2e-6, 3.5e-6], [True, False]))
+        engine.add_stimulus(Stimulus('INC', [2e-6], [False]))
+        engine.add_stimulus(Stimulus('LOAD', [2e-6], [False]))
+
+        # Disable enables after init clock
+        for en in ['ACC_Enable', 'BREG_Enable', 'R0_Enable', 'IR_Enable']:
+            if en in pi:
+                engine.add_stimulus(Stimulus(en, [4e-6], [False]))
+
+        engine.run(4.5e-6)
+
+        # Now start executing instructions
+        t_current = 5e-6  # start after init settles
         trace = []
 
         for inst_num in range(n_instructions):
+            # Read current state from sim
+            pc = self._read_value_from_engine(engine, 'PC', n)
+            acc = self._read_value_from_engine(engine, 'ACC', n)
+            r0 = self._read_value_from_engine(engine, 'R0', n)
+            carry_ns = engine._nets.get('CARRY_4')
+            carry = 1 if carry_ns and carry_ns.value else 0
+
+            # Fetch from ROM
             opcode = self.rom.get(pc, 0x00)
             opr = (opcode >> 4) & 0xF
             inst_name = OPCODE_MAP.get(opr, 'NOP')
@@ -311,54 +365,82 @@ class CPU:
                 print(f"  [{inst_num:3d}] PC={pc:2d} [{opcode:02X}] {inst_name:4s}  "
                       f"ACC={acc:2d} C={carry} R0={r0:2d}", end="")
 
-            for step, signals in micro_steps:
+            # Load IR with opcode (no CLK cycle — just set the data)
+            for bit in range(8):
+                bv = bool((opcode >> bit) & 1)
+                engine.add_stimulus(Stimulus(f'IR_{bit}_In', [t_current], [bv]))
+            engine.add_stimulus(Stimulus('IR_Enable', [t_current], [True]))
+            # Let IR data settle without clocking
+            t_current += T_STEP / 4
+            engine.run(t_current)
+
+            # Execute each micro-step
+            for step_idx, (step, signals) in enumerate(micro_steps):
                 active = set(signals)
 
-                # Handle JCN conditional
                 if inst_name == 'JCN' and step == 3:
-                    if carry:
+                    carry_ns = engine._nets.get('CARRY_4')
+                    carry_now = 1 if carry_ns and carry_ns.value else 0
+                    if carry_now:
                         active.add('PC_LOAD')
                     else:
                         active.add('PC_INC')
 
-                # --- Execute this micro-step through gate-level ALU ---
-                # For bus operations, compute behaviorally what goes on the bus
-                bus_val = 0
-                if 'ACC_TO_BUS' in active:
-                    bus_val = acc
-                elif 'BREG_TO_BUS' in active:
-                    bus_val = breg
-                elif 'R0_TO_BUS' in active:
-                    bus_val = r0
-                elif 'IMM_TO_BUS' in active:
-                    bus_val = opcode & 0xF
+                # Set control signals
+                for sig in ALL_CONTROL_SIGNALS:
+                    if sig in pi:
+                        engine.add_stimulus(Stimulus(sig, [t_current],
+                                                     [sig in active]))
 
-                # For ALU ops, run through gate-level ALU
-                if 'ALU_ADD' in active or 'ALU_SUB' in active:
-                    b_val = 1 if 'ALU_B_IS_ONE' in active else breg
-                    is_sub = 'ALU_SUB' in active
-                    alu_result, alu_carry = self._run_gate_alu(acc, b_val, is_sub)
-                else:
-                    alu_result = acc
-                    alu_carry = carry
+                # ALU control
+                if 'ALU_B_IS_ONE' in pi:
+                    engine.add_stimulus(Stimulus('ALU_B_IS_ONE', [t_current],
+                                                 ['ALU_B_IS_ONE' in active]))
 
-                # --- Update state ---
-                if 'ACC_LOAD_FROM_ALU' in active:
-                    acc = alu_result
-                    carry = alu_carry
-                if 'ACC_LOAD_FROM_BUS' in active:
-                    acc = bus_val
-                if 'BREG_LOAD_FROM_BUS' in active:
-                    breg = bus_val
-                if 'R0_LOAD_FROM_BUS' in active:
-                    r0 = bus_val
+                engine.add_stimulus(Stimulus('SUB', [t_current],
+                                             ['ALU_SUB' in active]))
 
-                # PC update on last step
-                if step == micro_steps[-1][0]:
-                    if 'PC_LOAD' in active:
-                        pc = opcode & 0xF
-                    elif 'PC_INC' in active:
-                        pc = (pc + 1) & 0xF
+                # Register enables from active signals
+                acc_en = 'ACC_LOAD_FROM_ALU' in active or 'ACC_LOAD_FROM_BUS' in active
+                engine.add_stimulus(Stimulus('ACC_Enable', [t_current], [acc_en]))
+                breg_en = 'BREG_LOAD_FROM_BUS' in active
+                engine.add_stimulus(Stimulus('BREG_Enable', [t_current], [breg_en]))
+                r0_en = 'R0_LOAD_FROM_BUS' in active
+                engine.add_stimulus(Stimulus('R0_Enable', [t_current], [r0_en]))
+
+                # PC control — INC during CLK-low phase
+                pc_inc = 'PC_INC' in active
+                pc_load = 'PC_LOAD' in active
+                engine.add_stimulus(Stimulus('INC',
+                                             [t_current, t_current + T_STEP/2],
+                                             [False, pc_inc]))
+                engine.add_stimulus(Stimulus('LOAD', [t_current], [pc_load]))
+
+                # CLK: high for first half, low for second half
+                engine.add_stimulus(Stimulus('CLK',
+                                             [t_current, t_current + T_STEP/2],
+                                             [True, False]))
+
+                t_current += T_STEP
+                engine.run(t_current)
+
+            # Clear control signals after instruction
+            for sig in ALL_CONTROL_SIGNALS:
+                if sig in pi:
+                    engine.add_stimulus(Stimulus(sig, [t_current], [False]))
+            engine.add_stimulus(Stimulus('ACC_Enable', [t_current], [False]))
+            engine.add_stimulus(Stimulus('BREG_Enable', [t_current], [False]))
+            engine.add_stimulus(Stimulus('R0_Enable', [t_current], [False]))
+            engine.add_stimulus(Stimulus('IR_Enable', [t_current], [False]))
+            if 'ALU_B_IS_ONE' in pi:
+                engine.add_stimulus(Stimulus('ALU_B_IS_ONE', [t_current], [False]))
+
+            # Read final state
+            acc = self._read_value_from_engine(engine, 'ACC', n)
+            r0 = self._read_value_from_engine(engine, 'R0', n)
+            carry_ns = engine._nets.get('CARRY_4')
+            carry = 1 if carry_ns and carry_ns.value else 0
+            pc = self._read_value_from_engine(engine, 'PC', n)
 
             if verbose:
                 print(f" -> ACC={acc:2d} C={carry} R0={r0:2d} PC={pc:2d}")
@@ -367,68 +449,14 @@ class CPU:
 
         return trace
 
-    def _run_gate_alu(self, a_val, b_val, is_sub):
-        """Run a single ALU operation through real gates."""
-        V_HIGH, V_LOW = -0.8, -4.0
-        n = self.n_bits
-
-        netlist = Netlist.from_gates(self.gates,
-                                    primary_outputs={'OUT_0', 'OUT_1', 'OUT_2', 'OUT_3',
-                                                     'CARRY_4'})
-        engine = SimulationEngine(netlist, self.profiles,
-                                  v_high=V_HIGH, v_low=V_LOW,
-                                  auto_precompute_params=self.params_inv)
-
-        pi = netlist.primary_inputs
-
-        # Set ACC (ALU A input)
-        for bit in range(n):
-            bv = bool((a_val >> bit) & 1)
-            engine.add_stimulus(Stimulus(f'ACC_{bit}_In', [0, 1e-6], [not bv, bv]))
-
-        # Set BREG (ALU B input, or force to b_val)
-        for bit in range(n):
-            bv = bool((b_val >> bit) & 1)
-            engine.add_stimulus(Stimulus(f'BREG_{bit}_In', [0, 1e-6], [not bv, bv]))
-
-        # R0, IR — set to 0 (don't care)
-        for bit in range(n):
-            engine.add_stimulus(Stimulus(f'R0_{bit}_In', [0, 1e-6], [True, False]))
-        for bit in range(8):
-            engine.add_stimulus(Stimulus(f'IR_{bit}_In', [0, 1e-6], [True, False]))
-
-        # Control signals
-        for sig in pi:
-            if sig in ('CLK', 'INC', 'LOAD', 'PC_Enable', 'IR_Enable', 'SUB',
-                       'ALU_B_IS_ONE'):
-                continue
-            if sig.endswith('_In'):
-                continue
-            engine.add_stimulus(Stimulus(sig, [0, 1e-6], [True, False]))
-
-        engine.add_stimulus(Stimulus('CLK', [0, 1e-6, 6e-6], [True, True, False]))
-        engine.add_stimulus(Stimulus('ACC_Enable', [0, 1e-6], [True, True]))
-        engine.add_stimulus(Stimulus('BREG_Enable', [0, 1e-6], [True, True]))
-        engine.add_stimulus(Stimulus('R0_Enable', [0, 1e-6], [True, False]))
-        engine.add_stimulus(Stimulus('IR_Enable', [0, 1e-6], [True, True]))
-        engine.add_stimulus(Stimulus('PC_Enable', [0, 1e-6], [True, False]))
-        engine.add_stimulus(Stimulus('INC', [0, 1e-6], [True, False]))
-        engine.add_stimulus(Stimulus('LOAD', [0, 1e-6], [True, False]))
-        engine.add_stimulus(Stimulus('SUB', [0, 1e-6], [not is_sub, is_sub]))
-
-        # ALU_B_IS_ONE: force B=1 for increment
-        b_is_one = (b_val == 1)
-        if 'ALU_B_IS_ONE' in pi:
-            engine.add_stimulus(Stimulus('ALU_B_IS_ONE',
-                                         [0, 1e-6], [not b_is_one, b_is_one]))
-
-        result = engine.run(10e-6)
-
-        out_val = self._read_value(result, 'OUT', n)
-        carry_ns = result.net_states.get('CARRY_4')
-        carry_out = 1 if carry_ns and carry_ns.value else 0
-
-        return out_val, carry_out
+    def _read_value_from_engine(self, engine, prefix, n_bits):
+        """Read a multi-bit value from the live engine state."""
+        val = 0
+        for bit in range(n_bits):
+            ns = engine._nets.get(f'{prefix}_{bit}')
+            if ns and ns.value:
+                val |= (1 << bit)
+        return val
 
     def _read_value(self, result, prefix, n_bits):
         val = 0
