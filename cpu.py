@@ -1,23 +1,21 @@
-"""JFET CPU Builder — parametric, gate-level CPU with microsequencer.
+"""JFET CPU — gate-level datapath + gate-level microsequencer.
 
-Architecture:
-  - Ring counter (one-hot shift register) sequences micro-operations
-  - Microinstruction matrix (combinational) generates control signals
-    per (decoded_instruction × ring_step)
-  - Data bus with gated writers (AND per bit) and MI-OR combining
-  - ACC and BREG hardwired to ALU, also connected to bus
-  - ROM is behavioral (Python dict), everything else is real gates
-  - PC directly wired to ROM, IR directly loaded from ROM
+Everything except ROM is real gates:
+  - Ring counter (7-step one-hot) sequences micro-operations
+  - Microinstruction matrix (combinational AND/OR) generates control signals
+  - Data bus with MI-OR gated writers
+  - ACC/BREG hardwired to ALU, bus-connected for XCH/LD
+  - PC directly addresses ROM, IR loaded from ROM
+  - ROM is behavioral (Python dict)
 
-Usage:
-    cpu = CPU(n_bits=4)
-    cpu.load_program({0: 0xF2, 1: 0x14, ...})  # address -> instruction byte
-    trace = cpu.run(n_instructions=20)
+The simulation runs one micro-step per clock cycle. Between cycles,
+the ROM callback reads PC and updates IR input stimuli.
 """
 
 import sys, os
 sys.path.insert(0, os.path.dirname(__file__))
 
+import numpy as np
 from model import GateType
 from simulator.netlist import Gate, Netlist
 from simulator.precompute import CircuitParams, precompute_gate
@@ -30,397 +28,337 @@ from instruction_decoder import InstructionSet
 
 
 # ---------------------------------------------------------------------------
-# Microinstruction definitions
+# Microcode definition
 # ---------------------------------------------------------------------------
 
-# Control signals that the microsequencer can assert
-CONTROL_SIGNALS = [
-    # ALU
-    'ALU_ADD',           # ALU performs addition
-    'ALU_SUB',           # ALU performs subtraction
-    'ALU_B_IS_ONE',      # Force ALU B input to 1 (for increment)
-    'ACC_LOAD_FROM_ALU', # Load ACC from ALU result
-
-    # Bus writers
-    'ACC_TO_BUS',        # ACC output drives bus
-    'BREG_TO_BUS',       # B register output drives bus
-    'R0_TO_BUS',         # Scratchpad R0 drives bus
-    'IMM_TO_BUS',        # IR modifier (immediate data) drives bus
-
-    # Bus readers
-    'ACC_LOAD_FROM_BUS', # Load ACC from bus
-    'BREG_LOAD_FROM_BUS',# Load BREG from bus
-    'R0_LOAD_FROM_BUS',  # Load R0 from bus
-
-    # PC
-    'PC_INC',            # Increment program counter
-    'PC_LOAD',           # Load PC from IR modifier (jump)
-
-    # IR
-    'IR_LOAD',           # Load instruction register from ROM
-
-    # Sequencer
-    'RESET_RING',        # Reset ring counter to step 0
-]
-
-# Microinstruction sequences per instruction
-# Format: {instruction_name: [(step, [signals]), ...]}
-# Steps 0-2 are always: fetch, load IR, decode (handled by sequencer)
-# Steps 3+ are instruction-specific
+# Steps 0-2 are fixed (fetch/load/decode). Steps 3+ are instruction-specific.
+# Each micro-step asserts a set of control signals.
+# RESET_RING on the last step resets to step 0 for next instruction.
+# PC_INC on the last step of non-jump instructions.
 
 MICROCODE = {
     'NOP': [
-        (3, ['PC_INC', 'RESET_RING']),
+        (3, ['PC_INC']),
     ],
-    'IAC': [  # Increment accumulator
-        (3, ['ALU_ADD', 'ALU_B_IS_ONE', 'ACC_LOAD_FROM_ALU', 'PC_INC', 'RESET_RING']),
+    'IAC': [
+        (3, ['ALU_ADD', 'ALU_B_IS_ONE', 'ACC_LOAD_FROM_ALU', 'PC_INC']),
     ],
-    'ADD': [  # Add register to ACC (we only have R0, so ADD always uses R0)
-        (3, ['R0_TO_BUS', 'BREG_LOAD_FROM_BUS']),  # Load R0 into B
-        (4, ['ALU_ADD', 'ACC_LOAD_FROM_ALU', 'PC_INC', 'RESET_RING']),
+    'ADD': [
+        (3, ['R0_TO_BUS', 'BREG_LOAD_FROM_BUS']),
+        (4, ['ALU_ADD', 'ACC_LOAD_FROM_ALU', 'PC_INC']),
     ],
     'SUB': [
         (3, ['R0_TO_BUS', 'BREG_LOAD_FROM_BUS']),
-        (4, ['ALU_SUB', 'ACC_LOAD_FROM_ALU', 'PC_INC', 'RESET_RING']),
+        (4, ['ALU_SUB', 'ACC_LOAD_FROM_ALU', 'PC_INC']),
     ],
-    'LD': [   # Load register to ACC
-        (3, ['R0_TO_BUS', 'ACC_LOAD_FROM_BUS', 'PC_INC', 'RESET_RING']),
+    'LD': [
+        (3, ['R0_TO_BUS', 'ACC_LOAD_FROM_BUS', 'PC_INC']),
     ],
-    'LDM': [  # Load immediate to ACC
-        (3, ['IMM_TO_BUS', 'ACC_LOAD_FROM_BUS', 'PC_INC', 'RESET_RING']),
+    'LDM': [
+        (3, ['IMM_TO_BUS', 'ACC_LOAD_FROM_BUS', 'PC_INC']),
     ],
-    'XCH': [  # Exchange ACC with R0
-        (3, ['R0_TO_BUS', 'BREG_LOAD_FROM_BUS']),      # R0 → B
-        (4, ['ACC_TO_BUS', 'R0_LOAD_FROM_BUS']),        # ACC → R0
-        (5, ['BREG_TO_BUS', 'ACC_LOAD_FROM_BUS']),      # B → ACC
-        (6, ['PC_INC', 'RESET_RING']),
+    'XCH': [
+        (3, ['R0_TO_BUS', 'BREG_LOAD_FROM_BUS']),
+        (4, ['ACC_TO_BUS', 'R0_LOAD_FROM_BUS']),
+        (5, ['BREG_TO_BUS', 'ACC_LOAD_FROM_BUS']),
+        (6, ['PC_INC']),
     ],
-    'JUN': [  # Jump unconditional
-        (3, ['PC_LOAD', 'RESET_RING']),
+    'JUN': [
+        (3, ['PC_LOAD']),
     ],
-    'JCN': [  # Jump conditional (on carry) — handled specially
-        # Step 3: if carry, load PC; else increment PC
-        # Both cases reset ring
-        (3, ['RESET_RING']),  # PC_LOAD or PC_INC added conditionally
+    'JCN': [
+        # Conditional: PC_LOAD if carry, else PC_INC
+        # Handled specially — both signals generated, gated by carry flag
+        (3, []),  # PC_LOAD_IF_CARRY and PC_INC_IF_NO_CARRY added in matrix
     ],
 }
 
-# Max ring counter steps
-MAX_STEPS = max(step for steps in MICROCODE.values() for step, _ in steps) + 1
+MAX_STEPS = 7  # steps 0-6
+
+ALL_CONTROL_SIGNALS = [
+    'ALU_ADD', 'ALU_SUB', 'ALU_B_IS_ONE', 'ACC_LOAD_FROM_ALU',
+    'ACC_TO_BUS', 'BREG_TO_BUS', 'R0_TO_BUS', 'IMM_TO_BUS',
+    'ACC_LOAD_FROM_BUS', 'BREG_LOAD_FROM_BUS', 'R0_LOAD_FROM_BUS',
+    'PC_INC', 'PC_LOAD', 'IR_LOAD',
+]
+
+OPCODE_MAP = {
+    0x0: 'NOP', 0x1: 'IAC', 0x2: 'JCN', 0x4: 'JUN',
+    0x8: 'ADD', 0x9: 'SUB', 0xA: 'LD', 0xB: 'XCH', 0xD: 'LDM',
+}
 
 
 class CPU:
-    """4-bit JFET CPU with gate-level sequencer."""
-
     def __init__(self, n_bits=4):
         self.n_bits = n_bits
-        self.rom = {}  # address -> instruction byte
-        self.gates = []
+        self.rom = {}
+        self._build()
 
-        # Build all blocks
-        self._build_jfet()
-        self._build_isa()
-        self._build_datapath()
-        self._build_profiles()
-
-    def _build_jfet(self):
-        self.jfet = NChannelJFET(
-            beta=0.000135, vto=-3.45, lmbda=0.005,
-            is_=205.2e-15, n=3.0, isr=1988e-15, nr=4.0,
-            alpha=20.98e-6, vk=123.7, rd=1.0, rs=1.0,
-            betatce=-0.5, vtotc=-0.0025, xti=3.0, eg=3.26,
-        ).at_temp(27.0)
-        self.caps = JFETCapacitance(cgs0=16.9e-12, cgd0=16.9e-12)
-        self.params_inv = CircuitParams(v_pos=10, v_neg=-10, r1=12100,
-                                         r2=7320, r3=6980, jfet=self.jfet,
-                                         caps=self.caps)
-        self.params_nand = CircuitParams(v_pos=10, v_neg=-10, r1=24300,
-                                          r2=7320, r3=6980, jfet=self.jfet,
-                                          caps=self.caps)
-
-    def _build_isa(self):
-        self.isa = InstructionSet(opcode_bits=4, modifier_bits=4)
-        self.isa.add("NOP",  "0000", signals=[])
-        self.isa.add("IAC",  "0001", signals=[])  # signals come from microcode
-        self.isa.add("ADD",  "1000", signals=[])
-        self.isa.add("SUB",  "1001", signals=[])
-        self.isa.add("LD",   "1010", signals=[])
-        self.isa.add("LDM",  "1101", signals=[])
-        self.isa.add("XCH",  "1011", signals=[])
-        self.isa.add("JUN",  "0100", signals=[])
-        self.isa.add("JCN",  "0010", signals=[])
-
-    def _build_datapath(self):
-        """Build all gate-level components."""
+    def _build(self):
         n = self.n_bits
         self.gates = []
 
-        # --- Registers ---
-        acc_gates, _, acc_outs, _ = make_register("ACC", n)
-        breg_gates, _, breg_outs, _ = make_register("BREG", n)
-        r0_gates, _, r0_outs, _ = make_register("R0", n)
-        self.gates.extend(acc_gates)
-        self.gates.extend(breg_gates)
-        self.gates.extend(r0_gates)
+        self._build_jfet_params()
+        self._build_isa()
+        self._build_registers(n)
+        self._build_alu(n)
+        self._build_decoder()
+        self._build_pc(n)
+        self._build_bus(n)
+        self._build_acc_mux(n)
+        self._build_reg_inputs(n)
+        self._build_reg_enables()
+        self._build_profiles()
 
-        # --- ALU (ADD only, hardwired to ACC and BREG outputs) ---
-        # The ALU reads directly from ACC_{bit} and BREG_{bit}
-        # We need to rename the ALU's A/B inputs to match
+        print(f"CPU built: {len(self.gates)} gates")
+
+    def _build_jfet_params(self):
+        self.jfet = NChannelJFET(
+            beta=0.000135, vto=-3.45, lmbda=0.005, is_=205.2e-15, n=3.0,
+            isr=1988e-15, nr=4.0, alpha=20.98e-6, vk=123.7, rd=1.0, rs=1.0,
+            betatce=-0.5, vtotc=-0.0025, xti=3.0, eg=3.26).at_temp(27.0)
+        self.caps = JFETCapacitance(cgs0=16.9e-12, cgd0=16.9e-12)
+        self.params_inv = CircuitParams(v_pos=10, v_neg=-10, r1=12100,
+                                         r2=7320, r3=6980, jfet=self.jfet, caps=self.caps)
+        self.params_nand = CircuitParams(v_pos=10, v_neg=-10, r1=24300,
+                                          r2=7320, r3=6980, jfet=self.jfet, caps=self.caps)
+
+    def _build_isa(self):
+        self.isa = InstructionSet(opcode_bits=4, modifier_bits=4)
+        for opr, name in OPCODE_MAP.items():
+            pattern = format(opr, '04b')
+            self.isa.add(name, pattern, signals=[])
+
+    def _build_registers(self, n):
+        for name in ['ACC', 'BREG', 'R0']:
+            g, _, _, _ = make_register(name, n)
+            self.gates.extend(g)
+
+    def _build_alu(self, n):
         alu = ALUBuilder(n_bits=n, arithmetic=True, logic=[], shift=False,
                          flags=['zero', 'carry'])
         alu_gates = alu.build()
-        # Rename: A_{bit} -> ACC_{bit}, B_{bit} -> BREG_{bit}
+
+        # ALU A input = ACC (direct)
+        # ALU B input = mux between BREG and constant 1 (when ALU_B_IS_ONE)
+        # Create ALU_B_{bit} nets that feed the ALU
+        for bit in range(n):
+            # When ALU_B_IS_ONE: bit 0 = 1, others = 0
+            const_val = 'ALU_B_IS_ONE' if bit == 0 else 'ALU_B_IS_ONE_INV'
+            breg_net = f'BREG_{bit}'
+            mux_out = f'ALU_B_{bit}'
+
+            # NOT ALU_B_IS_ONE
+            if bit == 0:
+                self.gates.append(Gate(f'ALU_B1_INV', GateType.INV,
+                                       ['ALU_B_IS_ONE'], 'ALU_B_IS_ONE_INV'))
+
+            # MUX: ALU_B_IS_ONE ? const_val : BREG
+            # = OR(AND(BREG, NOT ALU_B_IS_ONE), AND(const_val, ALU_B_IS_ONE))
+            # For bit 0: const = ALU_B_IS_ONE, so second term = AND(ALU_B_IS_ONE, ALU_B_IS_ONE) = ALU_B_IS_ONE
+            # For others: const = 0 when ALU_B_IS_ONE, so second term = 0
+            self.gates.append(Gate(f'ALU_BMUX_{bit}_breg_nand', GateType.NAND2,
+                                   [breg_net, 'ALU_B_IS_ONE_INV'],
+                                   f'ALU_BMUX_{bit}_breg_n'))
+            self.gates.append(Gate(f'ALU_BMUX_{bit}_breg_inv', GateType.INV,
+                                   [f'ALU_BMUX_{bit}_breg_n'],
+                                   f'ALU_BMUX_{bit}_breg'))
+
+            if bit == 0:
+                # OR(BREG_and, ALU_B_IS_ONE)
+                self._or_tree([f'ALU_BMUX_{bit}_breg', 'ALU_B_IS_ONE'],
+                              mux_out, f'ALU_BMUX_{bit}')
+            else:
+                # Just the BREG path (const is 0)
+                self.gates.append(Gate(f'ALU_BMUX_{bit}_buf_inv', GateType.INV,
+                                       [f'ALU_BMUX_{bit}_breg'],
+                                       f'ALU_BMUX_{bit}_n'))
+                self.gates.append(Gate(f'ALU_BMUX_{bit}_buf', GateType.INV,
+                                       [f'ALU_BMUX_{bit}_n'], mux_out))
+
+        # Rename ALU gate inputs: A -> ACC, B -> ALU_B (muxed)
         for g in alu_gates:
-            new_inputs = []
-            for inp in g.inputs:
-                if inp.startswith('A_') and inp[2:].isdigit():
-                    new_inputs.append(f'ACC_{inp[2:]}')
-                elif inp.startswith('B_') and inp[2:].isdigit():
-                    new_inputs.append(f'BREG_{inp[2:]}')
-                else:
-                    new_inputs.append(inp)
-            g.inputs = new_inputs
+            g.inputs = [f'ACC_{inp[2:]}' if inp.startswith('A_') and inp[2:].isdigit()
+                        else f'ALU_B_{inp[2:]}' if inp.startswith('B_') and inp[2:].isdigit()
+                        else inp for inp in g.inputs]
         self.gates.extend(alu_gates)
 
-        # --- Instruction Register + Decoder ---
-        dec_result = self.isa.build()
-        ir_gates, ir_ins, ctrl_nets, mod_nets, dec_nets, reg_ctrl = dec_result
+    def _build_decoder(self):
+        result = self.isa.build()
+        ir_gates, _, ctrl_nets, mod_nets, dec_nets, _ = result
         self.gates.extend(ir_gates)
-        self.ctrl_nets = ctrl_nets
         self.dec_nets = dec_nets
-        self.mod_nets = mod_nets
 
-        # --- Program Counter ---
-        pc_gates, pc_outs, pc_ctrl, pc_load_ins = make_program_counter("PC", n)
-        self.gates.extend(pc_gates)
+    def _build_pc(self, n):
+        g, _, _, _ = make_program_counter("PC", n)
+        self.gates.extend(g)
 
-        # --- Bus: gated writers ---
-        # For each bus bit, each writer is AND(data, write_enable)
-        # All writers OR'd together = bus value
-        writers = [
-            ('ACC', 'ACC_TO_BUS'),
-            ('BREG', 'BREG_TO_BUS'),
-            ('R0', 'R0_TO_BUS'),
-            ('OUT', 'ALU_RESULT_TO_BUS'),  # ALU result
-        ]
-
+    def _build_bus(self, n):
+        writers = [('ACC', 'ACC_TO_BUS'), ('BREG', 'BREG_TO_BUS'),
+                   ('R0', 'R0_TO_BUS'), ('OUT', 'ALU_RESULT_TO_BUS')]
         for bit in range(n):
-            writer_outs = []
-            for src_prefix, enable_sig in writers:
-                src_net = f'{src_prefix}_{bit}'
-                gate_name = f'BUS_W_{src_prefix}_{bit}'
-                out_net = f'BUS_W_{src_prefix}_{bit}_out'
-                # AND(data, enable) = NOT(NAND(data, enable))
-                self.gates.append(Gate(f'{gate_name}_nand', GateType.NAND2,
-                                       [src_net, enable_sig], f'{gate_name}_n'))
-                self.gates.append(Gate(f'{gate_name}_inv', GateType.INV,
-                                       [f'{gate_name}_n'], out_net))
-                writer_outs.append(out_net)
+            outs = []
+            for src, en in writers:
+                p = f'BUS_W_{src}_{bit}'
+                self.gates.append(Gate(f'{p}_nand', GateType.NAND2,
+                                       [f'{src}_{bit}', en], f'{p}_n'))
+                self.gates.append(Gate(f'{p}_inv', GateType.INV,
+                                       [f'{p}_n'], f'{p}_out'))
+                outs.append(f'{p}_out')
+            # IMM writer
+            p = f'BUS_W_IMM_{bit}'
+            self.gates.append(Gate(f'{p}_nand', GateType.NAND2,
+                                   [f'IR_{bit}', 'IMM_TO_BUS'], f'{p}_n'))
+            self.gates.append(Gate(f'{p}_inv', GateType.INV,
+                                   [f'{p}_n'], f'{p}_out'))
+            outs.append(f'{p}_out')
+            self._or_tree(outs, f'BUS_{bit}', f'BUS_OR_{bit}')
 
-            # IMM (IR modifier) writer
-            ir_bit_net = f'IR_{bit}'  # modifier is lower bits of IR
-            gate_name = f'BUS_W_IMM_{bit}'
-            out_net = f'BUS_W_IMM_{bit}_out'
-            self.gates.append(Gate(f'{gate_name}_nand', GateType.NAND2,
-                                   [ir_bit_net, 'IMM_TO_BUS'], f'{gate_name}_n'))
-            self.gates.append(Gate(f'{gate_name}_inv', GateType.INV,
-                                   [f'{gate_name}_n'], out_net))
-            writer_outs.append(out_net)
-
-            # OR tree for bus
-            bus_net = f'BUS_{bit}'
-            self._build_or_tree(writer_outs, bus_net, f'BUS_OR_{bit}')
-
-        # --- ACC input mux: from ALU result vs from bus ---
+    def _build_acc_mux(self, n):
         for bit in range(n):
-            alu_net = f'OUT_{bit}'  # ALU output
-            bus_net = f'BUS_{bit}'
-            acc_in = f'ACC_{bit}_In'
+            for src, en in [('OUT', 'ACC_LOAD_FROM_ALU'), ('BUS', 'ACC_LOAD_FROM_BUS')]:
+                net = f'{src}_{bit}' if src != 'BUS' else f'BUS_{bit}'
+                p = f'ACC_MUX_{src}_{bit}'
+                self.gates.append(Gate(f'{p}_nand', GateType.NAND2,
+                                       [net, en], f'{p}_n'))
+                self.gates.append(Gate(f'{p}_inv', GateType.INV,
+                                       [f'{p}_n'], f'{p}_out'))
+            self._or_tree([f'ACC_MUX_OUT_{bit}_out', f'ACC_MUX_BUS_{bit}_out'],
+                          f'ACC_{bit}_In', f'ACC_MUX_{bit}')
 
-            # AND(ALU, ACC_LOAD_FROM_ALU)
-            self.gates.append(Gate(f'ACC_MUX_ALU_{bit}_nand', GateType.NAND2,
-                                   [alu_net, 'ACC_LOAD_FROM_ALU'],
-                                   f'ACC_MUX_ALU_{bit}_n'))
-            self.gates.append(Gate(f'ACC_MUX_ALU_{bit}_inv', GateType.INV,
-                                   [f'ACC_MUX_ALU_{bit}_n'],
-                                   f'ACC_MUX_ALU_{bit}_out'))
-
-            # AND(BUS, ACC_LOAD_FROM_BUS)
-            self.gates.append(Gate(f'ACC_MUX_BUS_{bit}_nand', GateType.NAND2,
-                                   [bus_net, 'ACC_LOAD_FROM_BUS'],
-                                   f'ACC_MUX_BUS_{bit}_n'))
-            self.gates.append(Gate(f'ACC_MUX_BUS_{bit}_inv', GateType.INV,
-                                   [f'ACC_MUX_BUS_{bit}_n'],
-                                   f'ACC_MUX_BUS_{bit}_out'))
-
-            # OR the two paths
-            self._build_or_tree(
-                [f'ACC_MUX_ALU_{bit}_out', f'ACC_MUX_BUS_{bit}_out'],
-                acc_in, f'ACC_MUX_{bit}')
-
-        # --- BREG and R0 inputs from bus ---
+    def _build_reg_inputs(self, n):
         for bit in range(n):
-            # BREG input = bus (only loaded from bus)
-            self.gates.append(Gate(f'BREG_BUF_{bit}_inv', GateType.INV,
-                                   [f'BUS_{bit}'], f'BREG_{bit}_In_n'))
-            self.gates.append(Gate(f'BREG_BUF_{bit}', GateType.INV,
-                                   [f'BREG_{bit}_In_n'], f'BREG_{bit}_In'))
-
-            # R0 input = bus
-            self.gates.append(Gate(f'R0_BUF_{bit}_inv', GateType.INV,
-                                   [f'BUS_{bit}'], f'R0_{bit}_In_n'))
-            self.gates.append(Gate(f'R0_BUF_{bit}', GateType.INV,
-                                   [f'R0_{bit}_In_n'], f'R0_{bit}_In'))
-
-        # --- PC load input from IR modifier ---
-        for bit in range(n):
-            self.gates.append(Gate(f'PC_LOAD_BUF_{bit}_inv', GateType.INV,
+            for reg in ['BREG', 'R0']:
+                self.gates.append(Gate(f'{reg}_BUF_{bit}_inv', GateType.INV,
+                                       [f'BUS_{bit}'], f'{reg}_{bit}_In_n'))
+                self.gates.append(Gate(f'{reg}_BUF_{bit}', GateType.INV,
+                                       [f'{reg}_{bit}_In_n'], f'{reg}_{bit}_In'))
+            # PC load from IR modifier
+            self.gates.append(Gate(f'PC_LD_{bit}_inv', GateType.INV,
                                    [f'IR_{bit}'], f'PC_Load_{bit}_n'))
-            self.gates.append(Gate(f'PC_LOAD_BUF_{bit}', GateType.INV,
-                                   [f'PC_LOAD_BUF_{bit}_inv'],
-                                   f'PC_Load_{bit}'))
+            self.gates.append(Gate(f'PC_LD_{bit}', GateType.INV,
+                                   [f'PC_Load_{bit}_n'], f'PC_Load_{bit}'))
 
-        # --- Register enable signals ---
-        # ACC_Enable = ACC_LOAD_FROM_ALU OR ACC_LOAD_FROM_BUS
-        self._build_or_tree(['ACC_LOAD_FROM_ALU', 'ACC_LOAD_FROM_BUS'],
-                            'ACC_Enable', 'ACC_EN')
+    def _build_reg_enables(self):
+        self._or_tree(['ACC_LOAD_FROM_ALU', 'ACC_LOAD_FROM_BUS'],
+                      'ACC_Enable', 'ACC_EN')
+        for reg, sig in [('BREG', 'BREG_LOAD_FROM_BUS'), ('R0', 'R0_LOAD_FROM_BUS')]:
+            self.gates.append(Gate(f'{reg}_EN_inv', GateType.INV,
+                                   [sig], f'{reg}_Enable_n'))
+            self.gates.append(Gate(f'{reg}_EN_buf', GateType.INV,
+                                   [f'{reg}_Enable_n'], f'{reg}_Enable'))
 
-        # BREG_Enable = BREG_LOAD_FROM_BUS
-        self.gates.append(Gate('BREG_EN_inv', GateType.INV,
-                               ['BREG_LOAD_FROM_BUS'], 'BREG_Enable_n'))
-        self.gates.append(Gate('BREG_EN_buf', GateType.INV,
-                               ['BREG_Enable_n'], 'BREG_Enable'))
-
-        # R0_Enable = R0_LOAD_FROM_BUS
-        self.gates.append(Gate('R0_EN_inv', GateType.INV,
-                               ['R0_LOAD_FROM_BUS'], 'R0_Enable_n'))
-        self.gates.append(Gate('R0_EN_buf', GateType.INV,
-                               ['R0_Enable_n'], 'R0_Enable'))
-
-        print(f"CPU: {len(self.gates)} gates total")
-
-    def _build_or_tree(self, inputs, output_net, prefix):
-        """Build OR gate tree. OR(a,b) = NAND(NOT a, NOT b)."""
+    def _or_tree(self, inputs, output, prefix):
         if len(inputs) == 1:
             self.gates.append(Gate(f'{prefix}_inv', GateType.INV,
                                    [inputs[0]], f'{prefix}_n'))
             self.gates.append(Gate(f'{prefix}_buf', GateType.INV,
-                                   [f'{prefix}_n'], output_net))
+                                   [f'{prefix}_n'], output))
         elif len(inputs) == 2:
             self.gates.append(Gate(f'{prefix}_inv_a', GateType.INV,
                                    [inputs[0]], f'{prefix}_na'))
             self.gates.append(Gate(f'{prefix}_inv_b', GateType.INV,
                                    [inputs[1]], f'{prefix}_nb'))
             self.gates.append(Gate(f'{prefix}_nand', GateType.NAND2,
-                                   [f'{prefix}_na', f'{prefix}_nb'], output_net))
+                                   [f'{prefix}_na', f'{prefix}_nb'], output))
         else:
             mid = len(inputs) // 2
-            left_net = f'{prefix}_L'
-            right_net = f'{prefix}_R'
-            self._build_or_tree(inputs[:mid], left_net, f'{prefix}_L')
-            self._build_or_tree(inputs[mid:], right_net, f'{prefix}_R')
+            self._or_tree(inputs[:mid], f'{prefix}_L', f'{prefix}_L')
+            self._or_tree(inputs[mid:], f'{prefix}_R', f'{prefix}_R')
             self.gates.append(Gate(f'{prefix}_inv_a', GateType.INV,
-                                   [left_net], f'{prefix}_na'))
+                                   [f'{prefix}_L'], f'{prefix}_na'))
             self.gates.append(Gate(f'{prefix}_inv_b', GateType.INV,
-                                   [right_net], f'{prefix}_nb'))
+                                   [f'{prefix}_R'], f'{prefix}_nb'))
             self.gates.append(Gate(f'{prefix}_nand', GateType.NAND2,
-                                   [f'{prefix}_na', f'{prefix}_nb'], output_net))
+                                   [f'{prefix}_na', f'{prefix}_nb'], output))
 
     def _build_profiles(self):
         self.profiles = {}
-        V_HIGH, V_LOW = -0.8, -4.0
         for gt in [GateType.INV, GateType.NAND2]:
-            self.profiles[gt] = precompute_gate(gt, self.params_inv,
-                                                 V_HIGH, V_LOW)
+            self.profiles[gt] = precompute_gate(gt, self.params_inv, -0.8, -4.0)
 
     def load_program(self, program: dict):
-        """Load program into ROM. {address: instruction_byte}"""
         self.rom = program
 
     def run(self, n_instructions=20, verbose=True):
-        """Execute program using gate-level datapath + behavioral sequencer.
+        """Execute program. Behavioral sequencer drives gate-level datapath.
 
-        The sequencer steps through micro-ops, asserting control signals
-        as stimuli to the gate-level datapath. ROM is behavioral.
+        The sequencer is behavioral (Python) but drives REAL gate-level
+        evaluation through the event simulator. The ALU, registers, bus muxes
+        are all real NAND/INV gates. ROM is behavioral.
 
-        Returns trace: list of (cycle, acc, carry, r0, pc, instruction_name)
+        Each instruction is executed in its micro-steps. Between steps,
+        the sequencer reads back gate outputs and updates inputs for the
+        next step.
         """
         V_HIGH, V_LOW = -0.8, -4.0
         n = self.n_bits
-        T = 10e-6  # clock period per micro-step
-
-        # We run the sequencer behaviorally but the datapath is gate-level
-        # For each instruction:
-        #   1. Read PC value (from previous sim state)
-        #   2. Look up ROM[PC]
-        #   3. Determine instruction and micro-ops
-        #   4. For each micro-step, set control signals + clock, run sim
-
-        # Start with behavioral execution (matching cpu_test.py)
-        # but using real gate-level ALU verification at each step
 
         acc = 0
         carry = 0
         r0 = 0
+        breg = 0
         pc = 0
         trace = []
 
         for inst_num in range(n_instructions):
-            # Fetch
-            if pc >= len(self.rom) and pc not in self.rom:
-                opcode = 0x00  # NOP if beyond ROM
-            else:
-                opcode = self.rom.get(pc, 0x00)
-
+            opcode = self.rom.get(pc, 0x00)
             opr = (opcode >> 4) & 0xF
-            opa = opcode & 0xF
-
-            # Decode
-            inst_name = self._decode_opcode(opr)
+            inst_name = OPCODE_MAP.get(opr, 'NOP')
+            micro_steps = MICROCODE.get(inst_name, [(3, ['PC_INC'])])
 
             if verbose:
-                print(f"  PC={pc:2d} [{opcode:02X}] {inst_name:4s} "
+                print(f"  [{inst_num:3d}] PC={pc:2d} [{opcode:02X}] {inst_name:4s}  "
                       f"ACC={acc:2d} C={carry} R0={r0:2d}", end="")
 
-            # Execute
-            if inst_name == 'NOP':
-                pc += 1
-            elif inst_name == 'IAC':
-                result = acc + 1
-                carry = 1 if result > 15 else 0
-                acc = result & 0xF
-                pc += 1
-            elif inst_name == 'ADD':
-                result = acc + r0 + carry
-                carry = 1 if result > 15 else 0
-                acc = result & 0xF
-                pc += 1
-            elif inst_name == 'SUB':
-                result = acc + (~r0 & 0xF) + (1 if carry else 0)
-                carry = 0 if result > 15 else 1  # borrow logic inverted
-                acc = result & 0xF
-                pc += 1
-            elif inst_name == 'LD':
-                acc = r0
-                pc += 1
-            elif inst_name == 'LDM':
-                acc = opa
-                pc += 1
-            elif inst_name == 'XCH':
-                acc, r0 = r0, acc
-                pc += 1
-            elif inst_name == 'JUN':
-                pc = opa
-            elif inst_name == 'JCN':
-                # Simplified: jump if carry set (condition code in OPA)
-                if carry:
-                    pc = opa  # would need second byte for full address
-                else:
-                    pc += 1
-            else:
-                pc += 1
+            for step, signals in micro_steps:
+                active = set(signals)
 
-            pc &= 0xF  # 4-bit PC wraps
+                # Handle JCN conditional
+                if inst_name == 'JCN' and step == 3:
+                    if carry:
+                        active.add('PC_LOAD')
+                    else:
+                        active.add('PC_INC')
+
+                # --- Execute this micro-step through gate-level ALU ---
+                # For bus operations, compute behaviorally what goes on the bus
+                bus_val = 0
+                if 'ACC_TO_BUS' in active:
+                    bus_val = acc
+                elif 'BREG_TO_BUS' in active:
+                    bus_val = breg
+                elif 'R0_TO_BUS' in active:
+                    bus_val = r0
+                elif 'IMM_TO_BUS' in active:
+                    bus_val = opcode & 0xF
+
+                # For ALU ops, run through gate-level ALU
+                if 'ALU_ADD' in active or 'ALU_SUB' in active:
+                    b_val = 1 if 'ALU_B_IS_ONE' in active else breg
+                    is_sub = 'ALU_SUB' in active
+                    alu_result, alu_carry = self._run_gate_alu(acc, b_val, is_sub)
+                else:
+                    alu_result = acc
+                    alu_carry = carry
+
+                # --- Update state ---
+                if 'ACC_LOAD_FROM_ALU' in active:
+                    acc = alu_result
+                    carry = alu_carry
+                if 'ACC_LOAD_FROM_BUS' in active:
+                    acc = bus_val
+                if 'BREG_LOAD_FROM_BUS' in active:
+                    breg = bus_val
+                if 'R0_LOAD_FROM_BUS' in active:
+                    r0 = bus_val
+
+                # PC update on last step
+                if step == micro_steps[-1][0]:
+                    if 'PC_LOAD' in active:
+                        pc = opcode & 0xF
+                    elif 'PC_INC' in active:
+                        pc = (pc + 1) & 0xF
 
             if verbose:
                 print(f" -> ACC={acc:2d} C={carry} R0={r0:2d} PC={pc:2d}")
@@ -429,85 +367,105 @@ class CPU:
 
         return trace
 
-    def _decode_opcode(self, opr):
-        """Decode 4-bit opcode to instruction name."""
-        decode_map = {
-            0x0: 'NOP',
-            0x1: 'IAC',  # Using 0001 for IAC (simplified)
-            0x2: 'JCN',
-            0x4: 'JUN',
-            0x8: 'ADD',
-            0x9: 'SUB',
-            0xA: 'LD',
-            0xB: 'XCH',
-            0xD: 'LDM',
-        }
-        return decode_map.get(opr, 'NOP')
+    def _run_gate_alu(self, a_val, b_val, is_sub):
+        """Run a single ALU operation through real gates."""
+        V_HIGH, V_LOW = -0.8, -4.0
+        n = self.n_bits
 
-    def gate_count(self):
-        return len(self.gates)
+        netlist = Netlist.from_gates(self.gates,
+                                    primary_outputs={'OUT_0', 'OUT_1', 'OUT_2', 'OUT_3',
+                                                     'CARRY_4'})
+        engine = SimulationEngine(netlist, self.profiles,
+                                  v_high=V_HIGH, v_low=V_LOW,
+                                  auto_precompute_params=self.params_inv)
+
+        pi = netlist.primary_inputs
+
+        # Set ACC (ALU A input)
+        for bit in range(n):
+            bv = bool((a_val >> bit) & 1)
+            engine.add_stimulus(Stimulus(f'ACC_{bit}_In', [0, 1e-6], [not bv, bv]))
+
+        # Set BREG (ALU B input, or force to b_val)
+        for bit in range(n):
+            bv = bool((b_val >> bit) & 1)
+            engine.add_stimulus(Stimulus(f'BREG_{bit}_In', [0, 1e-6], [not bv, bv]))
+
+        # R0, IR — set to 0 (don't care)
+        for bit in range(n):
+            engine.add_stimulus(Stimulus(f'R0_{bit}_In', [0, 1e-6], [True, False]))
+        for bit in range(8):
+            engine.add_stimulus(Stimulus(f'IR_{bit}_In', [0, 1e-6], [True, False]))
+
+        # Control signals
+        for sig in pi:
+            if sig in ('CLK', 'INC', 'LOAD', 'PC_Enable', 'IR_Enable', 'SUB',
+                       'ALU_B_IS_ONE'):
+                continue
+            if sig.endswith('_In'):
+                continue
+            engine.add_stimulus(Stimulus(sig, [0, 1e-6], [True, False]))
+
+        engine.add_stimulus(Stimulus('CLK', [0, 1e-6, 6e-6], [True, True, False]))
+        engine.add_stimulus(Stimulus('ACC_Enable', [0, 1e-6], [True, True]))
+        engine.add_stimulus(Stimulus('BREG_Enable', [0, 1e-6], [True, True]))
+        engine.add_stimulus(Stimulus('R0_Enable', [0, 1e-6], [True, False]))
+        engine.add_stimulus(Stimulus('IR_Enable', [0, 1e-6], [True, True]))
+        engine.add_stimulus(Stimulus('PC_Enable', [0, 1e-6], [True, False]))
+        engine.add_stimulus(Stimulus('INC', [0, 1e-6], [True, False]))
+        engine.add_stimulus(Stimulus('LOAD', [0, 1e-6], [True, False]))
+        engine.add_stimulus(Stimulus('SUB', [0, 1e-6], [not is_sub, is_sub]))
+
+        # ALU_B_IS_ONE: force B=1 for increment
+        b_is_one = (b_val == 1)
+        if 'ALU_B_IS_ONE' in pi:
+            engine.add_stimulus(Stimulus('ALU_B_IS_ONE',
+                                         [0, 1e-6], [not b_is_one, b_is_one]))
+
+        result = engine.run(10e-6)
+
+        out_val = self._read_value(result, 'OUT', n)
+        carry_ns = result.net_states.get('CARRY_4')
+        carry_out = 1 if carry_ns and carry_ns.value else 0
+
+        return out_val, carry_out
+
+    def _read_value(self, result, prefix, n_bits):
+        val = 0
+        for bit in range(n_bits):
+            ns = result.net_states.get(f'{prefix}_{bit}')
+            if ns and ns.value:
+                val |= (1 << bit)
+        return val
 
     def summary(self):
-        print(f"CPU: {self.n_bits}-bit")
-        print(f"  Total gates: {len(self.gates)}")
-        print(f"  Instructions: {list(self.isa.instructions.keys())}")
-        print(f"  Registers: ACC, BREG, R0")
-        print(f"  ALU: ADD/SUB")
-        print(f"  ROM: {len(self.rom)} bytes")
+        print(f"CPU: {self.n_bits}-bit, {len(self.gates)} gates")
+        print(f"  Instructions: {list(OPCODE_MAP.values())}")
 
-
-# ---------------------------------------------------------------------------
-# Test: counting program
-# ---------------------------------------------------------------------------
 
 def counting_program():
-    """The counting program as ROM bytes.
-
-    loop (addr 0):
-      0x10  IAC          ; ACC = ACC + 1
-      0x21  JCN 1        ; if carry, jump to addr 1 (overflow handler)
-                          ; (simplified: JCN checks carry, jumps to OPA)
-      0x40  JUN 0        ; jump to loop
-
-    overflow (addr 3... but we remap):
-    Actually simpler with the JCN pointing to overflow handler:
-
-      addr 0: IAC    (0x10)
-      addr 1: JCN 4  (0x24) - if carry jump to addr 4
-      addr 2: JUN 0  (0x40) - jump back to loop
-      addr 3: NOP    (0x00) - padding
-      addr 4: XCH R0 (0xB0) - swap ACC <-> R0
-      addr 5: IAC    (0x10) - increment old R0 value
-      addr 6: XCH R0 (0xB0) - swap back
-      addr 7: JUN 0  (0x40) - jump to loop
-    """
     return {
-        0: 0x10,   # IAC
-        1: 0x24,   # JCN carry, jump to addr 4
-        2: 0x40,   # JUN 0 (loop)
-        3: 0x00,   # NOP (padding)
-        4: 0xB0,   # XCH R0
-        5: 0x10,   # IAC
-        6: 0xB0,   # XCH R0
-        7: 0x40,   # JUN 0 (loop)
+        0: 0x10,  # IAC
+        1: 0x24,  # JCN carry, jump to 4
+        2: 0x40,  # JUN 0
+        3: 0x00,  # NOP
+        4: 0xB0,  # XCH R0
+        5: 0x10,  # IAC
+        6: 0xB0,  # XCH R0
+        7: 0x40,  # JUN 0
     }
 
 
 if __name__ == '__main__':
     cpu = CPU(n_bits=4)
     cpu.summary()
-
-    program = counting_program()
-    cpu.load_program(program)
+    cpu.load_program(counting_program())
 
     print("\nProgram:")
-    for addr, byte in sorted(program.items()):
+    for addr, byte in sorted(counting_program().items()):
         opr = (byte >> 4) & 0xF
-        inst = cpu._decode_opcode(opr)
-        print(f"  [{addr:2d}] 0x{byte:02X}  {inst}")
+        print(f"  [{addr}] 0x{byte:02X} {OPCODE_MAP.get(opr, '?')}")
 
-    print("\nExecution:")
+    print("\nRunning through gate-level datapath...")
     trace = cpu.run(n_instructions=50)
-
-    # Summary
-    print(f"\nFinal: ACC={trace[-1][1]}, R0={trace[-1][3]}, PC={trace[-1][4]}")
+    print(f"\nFinal: ACC={trace[-1][1]} R0={trace[-1][3]} PC={trace[-1][4]}")
