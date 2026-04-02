@@ -107,6 +107,7 @@ class CPU:
         self._build_bus(n)
         self._build_acc_mux(n)
         self._build_reg_inputs(n)
+        self._build_carry_flag()
         self._build_reg_enables()
         self._build_profiles()
 
@@ -239,6 +240,26 @@ class CPU:
             self.gates.append(Gate(f'PC_LD_{bit}', GateType.INV,
                                    [f'PC_Load_{bit}_n'], f'PC_Load_{bit}'))
 
+    def _build_carry_flag(self):
+        """1-bit carry flag register. Latches CARRY_4 when ALU computes."""
+        # Carry flag = 1-bit master-slave FF storing the ALU carry output
+        # Enable: ACC_LOAD_FROM_ALU (only update carry when ALU result is stored)
+        carry_gates, _, _, _ = make_register("CY", 1)
+        self.gates.extend(carry_gates)
+
+        # Wire ALU carry output (CARRY_4) to carry register input (CY_0_In)
+        # CY_0_In is a primary input — we need a buffer from CARRY_4
+        self.gates.append(Gate('CY_BUF_inv', GateType.INV,
+                               ['CARRY_4'], 'CY_BUF_n'))
+        self.gates.append(Gate('CY_BUF', GateType.INV,
+                               ['CY_BUF_n'], 'CY_0_In'))
+
+        # CY_Enable = ACC_LOAD_FROM_ALU (carry updates when ACC gets ALU result)
+        self.gates.append(Gate('CY_EN_inv', GateType.INV,
+                               ['ACC_LOAD_FROM_ALU'], 'CY_EN_n'))
+        self.gates.append(Gate('CY_EN_buf', GateType.INV,
+                               ['CY_EN_n'], 'CY_Enable'))
+
     def _build_reg_enables(self):
         self._or_tree(['ACC_LOAD_FROM_ALU', 'ACC_LOAD_FROM_BUS'],
                       'ACC_Enable', 'ACC_EN')
@@ -296,7 +317,7 @@ class CPU:
         for prefix in ['ACC', 'R0', 'BREG', 'PC']:
             for bit in range(n):
                 outputs.add(f'{prefix}_{bit}')
-        outputs.update(['CARRY_4', 'FLAG_ZERO'] +
+        outputs.update(['CARRY_4', 'CY_0', 'FLAG_ZERO'] +
                        [f'OUT_{bit}' for bit in range(n)] +
                        [f'BUS_{bit}' for bit in range(n)])
 
@@ -314,7 +335,7 @@ class CPU:
 
         # Force all register Q outputs to LOW and Q_bar to HIGH
         # This is the async reset — directly setting latch state
-        for prefix in ['ACC', 'BREG', 'R0']:
+        for prefix in ['ACC', 'BREG', 'R0', 'CY']:
             for bit in range(n):
                 q_net = f'{prefix}_{bit}'
                 qb_net = f'{prefix}_{bit}_bar'
@@ -388,7 +409,12 @@ class CPU:
             pc = self._read_value_from_engine(engine, 'PC', n)
             acc = self._read_value_from_engine(engine, 'ACC', n)
             r0 = self._read_value_from_engine(engine, 'R0', n)
-            carry_ns = engine._nets.get('CARRY_4')
+            carry_ns = engine._nets.get('CY_0')
+            carry = 1 if carry_ns and carry_ns.value else 0
+
+            # Read carry BEFORE anything else this instruction
+            # (carry was latched by the previous instruction's ALU op)
+            carry_ns = engine._nets.get('CY_0')
             carry = 1 if carry_ns and carry_ns.value else 0
 
             # Fetch from ROM
@@ -433,7 +459,7 @@ class CPU:
                 active = set(signals)
 
                 if inst_name == 'JCN' and step == 3:
-                    carry_ns = engine._nets.get('CARRY_4')
+                    carry_ns = engine._nets.get('CY_0')
                     carry_now = 1 if carry_ns and carry_ns.value else 0
                     if carry_now:
                         active.add('PC_LOAD')
@@ -494,7 +520,7 @@ class CPU:
             # Read final state
             acc = self._read_value_from_engine(engine, 'ACC', n)
             r0 = self._read_value_from_engine(engine, 'R0', n)
-            carry_ns = engine._nets.get('CARRY_4')
+            carry_ns = engine._nets.get('CY_0')
             carry = 1 if carry_ns and carry_ns.value else 0
             pc = self._read_value_from_engine(engine, 'PC', n)
 
