@@ -62,49 +62,42 @@ COMPONENTS = [
     ("Counter_", "step_counter.asc"),
 
     # -- Composable: Scratchpad --
-    # The subfolder scratchpad/ contains one .asc per register pair plus
-    # a common.asc for shared bus wiring, decoders, etc.
-    # The analyzer determines which register pairs the program uses;
-    # only those pair .asc files are included in the build.
+    # subfolder scratchpad/ contains:
+    #   Controls.asc       — address decode, always needed if any pair is used
+    #   Bus1.asc           — data bus for pairs 1-4 (R0-R7)
+    #   Bus2.asc           — data bus for pairs 5-8 (R8-R15)
+    #   Pair 1.asc .. Pair 8.asc — one per register pair
+    #
+    # If no registers are used, the whole scratchpad is omitted.
+    # If any are used, Controls is always included, plus the relevant
+    # bus(es) and pair(s).
     ("Scratch_", {
         "folder": "scratchpad",
-        # "common" parts are always included (bus wiring, address decode, etc.)
-        "common": [
-            # "common.asc",  # uncomment when you create it
-        ],
-        # "parts" maps a profile field to individual .asc files.
-        # Key = field name from ResourceProfile (set of ints)
-        # Value = dict mapping each int to its .asc filename
+        "key": "register_pairs_used",  # set of pair indices 0-7 from profile
+
+        # Always included when ANY part is needed
+        "common": ["Controls.asc"],
+
+        # Group dependencies: if any part in the group is needed, include the dep
+        "groups": {
+            "Bus1.asc": [0, 1, 2, 3],   # pairs 1-4 (indices 0-3)
+            "Bus2.asc": [4, 5, 6, 7],   # pairs 5-8 (indices 4-7)
+        },
+
+        # Individual parts, keyed by pair index
         "parts": {
-            "key": "register_pairs_used",
-            "files": {
-                0: "pair_0.asc",   # R0, R1
-                1: "pair_1.asc",   # R2, R3
-                2: "pair_2.asc",   # R4, R5
-                3: "pair_3.asc",   # R6, R7
-                4: "pair_4.asc",   # R8, R9
-                5: "pair_5.asc",   # R10, R11
-                6: "pair_6.asc",   # R12, R13
-                7: "pair_7.asc",   # R14, R15
-            },
+            0: "Pair 1.asc",   # R0, R1
+            1: "Pair 2.asc",   # R2, R3
+            2: "Pair 3.asc",   # R4, R5
+            3: "Pair 4.asc",   # R6, R7
+            4: "Pair 5.asc",   # R8, R9
+            5: "Pair 6.asc",   # R10, R11
+            6: "Pair 7.asc",   # R12, R13
+            7: "Pair 8.asc",   # R14, R15
         },
     }),
 
     # -- Composable: Stack --
-    ("Stack_", {
-        "folder": "stack",
-        "common": [
-            # "common.asc",
-        ],
-        "parts": {
-            # Stack levels: program uses JMS/BBL, analyzer tracks max depth.
-            # key is a set-like field; we synthesise it from stack_depth_needed.
-            "key": "stack_levels_needed",   # [0], [0,1], or [0,1,2]
-            "files": {
-                0: "level_0.asc",
-                1: "level_1.asc",
-                2: "level_2.asc",
-            },
-        },
-    }),
+    # Not yet split into sub-parts. Using full stack.asc for now.
+    ("Stack_", "stack.asc"),
 ]

@@ -87,56 +87,69 @@ def read_asc(filepath: str) -> list:
     return lines[HEADER_LINES:]
 
 
-def resolve_composable(spec: dict, cpu_dir: str, profile: dict) -> list:
-    """Resolve a composable component into a list of .asc content lines.
+def resolve_composable(spec: dict, cpu_dir: str, prefix: str, profile: dict) -> tuple:
+    """Resolve a composable component, renaming each sub-file independently.
 
-    Args:
-        spec: the dict from config (folder, common, parts)
-        cpu_dir: path to the CPU project folder
-        profile: resource profile dict (or None for full build)
+    Sub-files often have overlapping component names (e.g. every Pair has J_A1).
+    We rename per-file with sub-prefixes to avoid collisions:
+        Scratch_Ctrl_J1, Scratch_B1_J1, Scratch_P1_J1, Scratch_P2_J1, ...
 
     Returns:
-        Combined content lines from all included sub-parts.
+        (renamed_lines, rename_map, included_filenames)
+        Empty if nothing is needed.
     """
     folder = os.path.join(cpu_dir, spec["folder"])
-    all_lines = []
-    included = []
+    key = spec["key"]
+    parts_map = spec.get("parts", {})
 
-    # Always include common parts
-    for common_file in spec.get("common", []):
-        path = os.path.join(folder, common_file)
-        if os.path.isfile(path):
-            all_lines.extend(read_asc(path))
-            included.append(common_file)
-
-    # Determine which parts to include
-    parts_spec = spec["parts"]
-    key = parts_spec["key"]
-    files_map = parts_spec["files"]
-
+    # Determine which part indices are needed
     if profile and key in profile:
-        # Profile tells us exactly which indices are needed
         needed = profile[key]
         if isinstance(needed, (list, set)):
             needed_set = set(needed)
         else:
-            # If it's a single int, include all up to that value
             needed_set = set(range(needed))
     else:
-        # No profile = full build, include everything
-        needed_set = set(files_map.keys())
+        # No profile = full build
+        needed_set = set(parts_map.keys())
 
+    if not needed_set:
+        return [], {}, []
+
+    all_lines = []
+    all_new_names = []  # flat list of all new names (no key collision)
+    included = []
+
+    def _include(filename, sub_prefix):
+        path = os.path.join(folder, filename)
+        if os.path.isfile(path):
+            content = read_asc(path)
+            full_prefix = f"{prefix}{sub_prefix}"
+            renamed, rmap = rename_components(content, full_prefix)
+            all_lines.extend(renamed)
+            all_new_names.extend(rmap.values())
+            included.append(filename)
+        else:
+            print(f"    WARNING: {path} not found, skipping")
+
+    # 1. Common parts
+    for i, common_file in enumerate(spec.get("common", [])):
+        # Generate short sub-prefix from filename
+        stem = os.path.splitext(common_file)[0][:4]
+        _include(common_file, f"{stem}_")
+
+    # 2. Group dependencies
+    for group_file, group_indices in spec.get("groups", {}).items():
+        if needed_set & set(group_indices):
+            stem = os.path.splitext(group_file)[0]
+            _include(group_file, f"{stem}_")
+
+    # 3. Individual parts
     for idx in sorted(needed_set):
-        if idx in files_map:
-            part_file = files_map[idx]
-            path = os.path.join(folder, part_file)
-            if os.path.isfile(path):
-                all_lines.extend(read_asc(path))
-                included.append(part_file)
-            else:
-                print(f"    WARNING: {path} not found, skipping")
+        if idx in parts_map:
+            _include(parts_map[idx], f"P{idx}_")
 
-    return all_lines, included
+    return all_lines, all_new_names, included
 
 
 def build(cpu_name: str, output_name: str = None,
@@ -188,40 +201,46 @@ def build(cpu_name: str, output_name: str = None,
             label = source
 
         elif isinstance(source, dict):
-            # Composable component — assembled from sub-parts
-            content, included = resolve_composable(source, cpu_dir, profile)
+            # Composable component — assembled from sub-parts, renamed per-file
+            renamed, rename_map, included = resolve_composable(
+                source, cpu_dir, prefix, profile)
 
-            if not content:
+            if not renamed:
                 folder = source["folder"]
-                if not included:
-                    print(f"  SKIP  {folder}/ (no parts needed or found)")
+                print(f"  SKIP  {folder}/ (no parts needed or found)")
                 continue
 
-            renamed, rename_map = rename_components(content, prefix)
             label = f"{source['folder']}/ ({len(included)} parts: {', '.join(included)})"
         else:
             print(f"  ERROR: unknown source type for {prefix}: {type(source)}")
             continue
 
-        # Check for duplicates
-        new_names = set(rename_map.values())
+        # Get list of new names (for fixed: from dict values, for composable: already a list)
+        if isinstance(source, dict):
+            new_name_list = rename_map  # already a list from resolve_composable
+        else:
+            new_name_list = list(rename_map.values())
+
+        new_names = set(new_name_list)
         dupes = new_names & all_names
         if dupes:
             print(f"  WARNING: duplicates after renaming: {dupes}")
         all_names |= new_names
-        total += len(rename_map)
+        total += len(new_name_list)
 
         with open(output_path, "a") as out:
             out.writelines(renamed)
 
-        # Stats
+        # Stats — extract component type (J, R, V, etc.) from renamed values
         counts = {}
-        for new_name in rename_map.values():
-            ctype = new_name[len(prefix)]
+        for new_name in new_name_list:
+            import re as _re
+            m = _re.search(r'([A-Z])\d+$', new_name)
+            ctype = m.group(1) if m else '?'
             counts[ctype] = counts.get(ctype, 0) + 1
         count_str = ", ".join(f"{k}:{v}" for k, v in sorted(counts.items()))
 
-        print(f"  {prefix:<10s} {label:<55s} {len(rename_map):>5d} ({count_str})")
+        print(f"  {prefix:<10s} {label:<55s} {len(new_name_list):>5d} ({count_str})")
 
     print(f"\n  Total: {total} components, {len(all_names)} unique names")
     if total != len(all_names):
