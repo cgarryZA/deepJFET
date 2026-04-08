@@ -37,6 +37,7 @@ import os
 import sys
 
 _root = os.path.join(os.path.dirname(__file__), "..")
+PROJECT_ROOT = os.path.abspath(_root)
 sys.path.insert(0, _root)
 
 # Logic voltage levels (from controls.asc)
@@ -473,7 +474,8 @@ def bit_voltage(byte_val: int, bit: int) -> float:
     return V_HIGH if (byte_val >> bit) & 1 else V_LOW
 
 
-def generate_pwl(rom: list, num_cycles: int, startup_delay: float = 2e-6) -> dict:
+def generate_pwl(rom: list, num_cycles: int, startup_delay: float = 2e-6,
+                 start_address: int = 0) -> dict:
     """Generate PWL waveforms for D0In-D3In by simulating program execution.
 
     PWL files use proper step transitions: each value change is a pair of
@@ -556,42 +558,73 @@ def generate_pwl(rom: list, num_cycles: int, startup_delay: float = 2e-6) -> dic
 
 
 def write_pwl_files(pwl: dict, output_dir: str):
-    """Write PWL waveforms to files."""
+    """Write PWL waveforms to files, ensuring strictly monotonic timestamps.
+
+    Removes redundant points (same voltage as previous) and nudges any
+    remaining duplicate timestamps so LTSpice sees monotonic data.
+    """
     os.makedirs(output_dir, exist_ok=True)
+    MIN_DT = 10e-9  # 10ns minimum gap between points
+
     for name, points in pwl.items():
+        # First pass: remove redundant consecutive same-voltage points
+        # (keep first and last of a run, drop middle)
+        cleaned = [points[0]]
+        for i in range(1, len(points)):
+            t, v = points[i]
+            if v != cleaned[-1][1] or i == len(points) - 1:
+                cleaned.append((t, v))
+            elif i + 1 < len(points) and points[i + 1][1] != v:
+                # Keep this point — it's the last before a transition
+                cleaned.append((t, v))
+
+        # Second pass: enforce strictly increasing timestamps
+        final = [cleaned[0]]
+        for i in range(1, len(cleaned)):
+            t, v = cleaned[i]
+            if t <= final[-1][0]:
+                t = final[-1][0] + MIN_DT
+            final.append((t, v))
+
         path = os.path.join(output_dir, f"{name}.pwl")
         with open(path, "w") as f:
-            for time, voltage in points:
+            for time, voltage in final:
                 f.write(f"{time:.9e} {voltage:.4f}\n")
-        print(f"  {name}.pwl: {len(points)} points, {points[-1][0]*1e6:.1f}us")
+        print(f"  {name}.pwl: {len(final)} points, {final[-1][0]*1e6:.1f}us")
 
 
-def main():
-    parser = argparse.ArgumentParser(description="4004 ROM emulator — generate PWL files")
-    parser.add_argument("asm_file", help="Path to .asm file")
-    parser.add_argument("--cycles", "-n", type=int, default=20,
-                        help="Number of instruction cycles to simulate (default: 20)")
-    parser.add_argument("--startup-delay", type=float, default=2e-6,
-                        help="Seconds before first instruction cycle (default: 2e-6)")
-    parser.add_argument("--output", "-o", default=None,
-                        help="Output directory (default: same as .asm file)")
-    parser.add_argument("--verbose", "-v", action="store_true",
-                        help="Print execution trace")
+def setup_program(cpu_name: str, program_name: str, asm_text: str,
+                  num_cycles: int = 20, startup_delay: float = 2e-6,
+                  verbose: bool = False):
+    """Full workflow: create program folder, assemble, generate PWLs, build CPU .asc.
 
-    args = parser.parse_args()
+    Creates:
+        cpus/<cpu>/programs/<program>/<program>.asm  (copy of source)
+        cpus/<cpu>/programs/<program>/d0in.pwl ... d3in.pwl
+        cpus/<cpu>/d0in.pwl ... d3in.pwl  (symlinks/copies for LTSpice)
+        cpus/<cpu>/<cpu>.asc  (combined CPU schematic)
 
-    # Read and assemble
-    with open(args.asm_file, "r") as f:
-        asm_text = f.read()
+    After LTSpice simulation, copy the .raw file:
+        cpus/<cpu>/<cpu>.raw  ->  cpus/<cpu>/programs/<program>/<program>.raw
+    """
+    cpu_dir = os.path.join(PROJECT_ROOT, "cpus", cpu_name)
+    prog_dir = os.path.join(cpu_dir, "programs", program_name)
+    os.makedirs(prog_dir, exist_ok=True)
 
+    # Save .asm to program folder
+    asm_path = os.path.join(prog_dir, f"{program_name}.asm")
+    with open(asm_path, "w") as f:
+        f.write(asm_text)
+    print(f"Program: {asm_path}")
+
+    # Assemble
     rom = assemble(asm_text)
-    print(f"Assembled {len(rom)} bytes from {args.asm_file}")
-    print(f"ROM: {' '.join(f'{b:02X}' for b in rom)}")
+    print(f"Assembled {len(rom)} bytes: {' '.join(f'{b:02X}' for b in rom)}")
 
     # Generate PWL
-    pwl, trace = generate_pwl(rom, args.cycles, args.startup_delay)
+    pwl, trace = generate_pwl(rom, num_cycles, startup_delay)
 
-    if args.verbose:
+    if verbose:
         print(f"\nExecution trace ({len(trace)} cycles):")
         for cycle, pc, b1, b2 in trace:
             if b2 is not None:
@@ -599,14 +632,90 @@ def main():
             else:
                 print(f"  [{cycle:3d}] PC={pc:03X}: {b1:02X}")
 
-    # Write PWL files
-    output_dir = args.output or os.path.dirname(args.asm_file)
-    print(f"\nWriting PWL files to {output_dir}/")
-    write_pwl_files(pwl, output_dir)
+    # Write PWL to program folder
+    print(f"\nWriting PWL files to {prog_dir}/")
+    write_pwl_files(pwl, prog_dir)
 
+    # Copy PWL files to CPU root (where the .asc expects them)
+    for name in ['d0in', 'd1in', 'd2in', 'd3in']:
+        src = os.path.join(prog_dir, f"{name}.pwl")
+        dst = os.path.join(cpu_dir, f"{name}.pwl")
+        import shutil
+        shutil.copy2(src, dst)
+    print(f"Copied PWL files to {cpu_dir}/")
+
+    # Build the CPU .asc
+    print()
+    sys.path.insert(0, os.path.join(PROJECT_ROOT, "tools"))
+    from build_cpu import build
+    build(cpu_name, output_name=f"{cpu_name}.asc")
+
+    # Patch .tran in the built .asc to match program length
     total_time = pwl['d0in'][-1][0]
-    print(f"\nTotal simulation time: {total_time*1e6:.1f}us")
-    print(f"Suggested .tran: {total_time:.6e}")
+    tran_us = int(total_time * 1e6) + 100  # add 100us margin
+    asc_path = os.path.join(cpu_dir, f"{cpu_name}.asc")
+    with open(asc_path, "r") as f:
+        content = f.read()
+    import re
+    content = re.sub(
+        r'(\.tran\s+\S+\s+)\S+(us\s+)',
+        rf'\g<1>{tran_us}\g<2>',
+        content
+    )
+    with open(asc_path, "w") as f:
+        f.write(content)
+    print(f"Patched .tran to {tran_us}us")
+
+    print(f"\nReady to simulate:")
+    print(f"  Open: cpus/{cpu_name}/{cpu_name}.asc")
+    print(f"  .tran covers: {total_time*1e6:.0f}us")
+    print(f"\nAfter simulation, copy the .raw:")
+    print(f"  cpus/{cpu_name}/{cpu_name}.raw -> cpus/{cpu_name}/programs/{program_name}/{program_name}.raw")
+
+    return prog_dir, trace
+
+
+def main():
+    parser = argparse.ArgumentParser(description="4004 ROM emulator — generate PWL files")
+    parser.add_argument("program", help="Program name or path to .asm file")
+    parser.add_argument("--cpu", "-c", default="4004",
+                        help="CPU project name (default: 4004)")
+    parser.add_argument("--cycles", "-n", type=int, default=20,
+                        help="Number of instruction cycles to simulate (default: 20)")
+    parser.add_argument("--startup-delay", type=float, default=2e-6,
+                        help="Seconds before first instruction cycle (default: 2e-6)")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Print execution trace")
+
+    args = parser.parse_args()
+
+    # Determine program name and load asm text
+    if os.path.isfile(args.program):
+        # Given a file path
+        asm_path = args.program
+        program_name = os.path.splitext(os.path.basename(asm_path))[0]
+        with open(asm_path, "r") as f:
+            asm_text = f.read()
+    else:
+        # Given a program name — look in programs folder
+        cpu_dir = os.path.join(PROJECT_ROOT, "cpus", args.cpu)
+        asm_path = os.path.join(cpu_dir, "programs", args.program, f"{args.program}.asm")
+        if not os.path.isfile(asm_path):
+            # Try as a bare name in programs/
+            for root, dirs, files in os.walk(os.path.join(cpu_dir, "programs")):
+                for f in files:
+                    if f.lower() == f"{args.program.lower()}.asm":
+                        asm_path = os.path.join(root, f)
+                        break
+        if not os.path.isfile(asm_path):
+            print(f"ERROR: Cannot find program '{args.program}'")
+            sys.exit(1)
+        program_name = args.program
+        with open(asm_path, "r") as f:
+            asm_text = f.read()
+
+    setup_program(args.cpu, program_name, asm_text,
+                  args.cycles, args.startup_delay, args.verbose)
 
 
 if __name__ == "__main__":

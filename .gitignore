@@ -5,8 +5,9 @@ __pycache__/
 *.db-wal
 *.bin
 ltspice/output/
-cpus/*/4004.asc
-cpus/*/test_*.asc
+# Generated CPU schematics (rebuilt by build_cpu.py)
+cpus/4004/4004.asc
+cpus/4004/Load5_test.asc
 *.raw
 *.op.raw
 *.log
