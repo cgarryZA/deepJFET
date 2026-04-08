@@ -98,6 +98,31 @@ COMPONENTS = [
     }),
 
     # -- Composable: Stack --
-    # Not yet split into sub-parts. Using full stack.asc for now.
-    ("Stack_", "stack.asc"),
+    # subfolder stack/ contains:
+    #   Controls.asc  — always needed
+    #   Bus.asc       — always needed
+    #   Level 1.asc   — always needed (program counter return)
+    #   Level 2.asc   — needed if JMS is used (1st subroutine call)
+    #   Level 3.asc   — needed if nested JMS before BBL (2nd nesting level)
+    #
+    # stack_depth_needed from the analyzer:
+    #   0 = no subroutines  -> still need Level 1 (PC lives here)
+    #   1 = one JMS/BBL     -> need Level 2
+    #   2 = nested JMS      -> need Level 2 + Level 3
+    ("Stack_", {
+        "folder": "stack",
+        "key": "stack_depth_needed",
+
+        # Always included
+        "common": ["Controls.asc", "Bus.asc", "Level 1.asc"],
+
+        # No groups needed — levels are independent
+        "groups": {},
+
+        # Level 2 needed at depth >= 1, Level 3 at depth >= 2
+        "parts": {
+            1: "Level 2.asc",
+            2: "Level 3.asc",
+        },
+    }),
 ]
