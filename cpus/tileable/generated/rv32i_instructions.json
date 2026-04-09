@@ -1,8 +1,20 @@
 {
     "name": "RV32I",
     "primary_bits": 5,
-    "primary_signals": ["Opcode0", "Opcode1", "Opcode2", "Opcode3", "Opcode4"],
-    "primary_bit_positions": [2, 3, 4, 5, 6],
+    "primary_signals": [
+        "Opcode0",
+        "Opcode1",
+        "Opcode2",
+        "Opcode3",
+        "Opcode4"
+    ],
+    "primary_bit_positions": [
+        2,
+        3,
+        4,
+        5,
+        6
+    ],
     "primary": {
         "13": "LUI",
         "5": "AUIPC",
@@ -17,23 +29,104 @@
         "28": "SYSTEM"
     },
     "secondary_bits": 3,
-    "secondary_signals": ["Funct3_0", "Funct3_1", "Funct3_2"],
-    "secondary_bit_positions": [12, 13, 14],
+    "secondary_signals": [
+        "Funct3_0",
+        "Funct3_1",
+        "Funct3_2"
+    ],
+    "secondary_bit_positions": [
+        12,
+        13,
+        14
+    ],
     "secondary": {
-        "24,0": "BEQ", "24,1": "BNE", "24,4": "BLT", "24,5": "BGE", "24,6": "BLTU", "24,7": "BGEU",
-        "0,0": "LB", "0,1": "LH", "0,2": "LW", "0,4": "LBU", "0,5": "LHU",
-        "8,0": "SB", "8,1": "SH", "8,2": "SW",
-        "4,0": "ADDI", "4,2": "SLTI", "4,3": "SLTIU", "4,4": "XORI", "4,6": "ORI", "4,7": "ANDI",
-        "4,1": "SLLI", "4,5": "SRLI_SRAI",
-        "12,0": "ADD_SUB", "12,1": "SLL", "12,2": "SLT", "12,3": "SLTU",
-        "12,4": "XOR", "12,5": "SRL_SRA", "12,6": "OR", "12,7": "AND"
+        "24,0": "BEQ",
+        "24,1": "BNE",
+        "24,4": "BLT",
+        "24,5": "BGE",
+        "24,6": "BLTU",
+        "24,7": "BGEU",
+        "0,0": "LB",
+        "0,1": "LH",
+        "0,2": "LW",
+        "0,4": "LBU",
+        "0,5": "LHU",
+        "8,0": "SB",
+        "8,1": "SH",
+        "8,2": "SW",
+        "4,0": "ADDI",
+        "4,2": "SLTI",
+        "4,3": "SLTIU",
+        "4,4": "XORI",
+        "4,6": "ORI",
+        "4,7": "ANDI",
+        "4,1": "SLLI",
+        "4,5": "SRLI_SRAI",
+        "12,0": "ADD_SUB",
+        "12,1": "SLL",
+        "12,2": "SLT",
+        "12,3": "SLTU",
+        "12,4": "XOR",
+        "12,5": "SRL_SRA",
+        "12,6": "OR",
+        "12,7": "AND"
     },
     "groups": {
-        "ALU_IMM": ["ADDI", "SLTI", "SLTIU", "XORI", "ORI", "ANDI", "SLLI", "SRLI_SRAI"],
-        "ALU_REG": ["ADD_SUB", "SLL", "SLT", "SLTU", "XOR", "SRL_SRA", "OR", "AND"],
-        "BRANCH_ANY": ["BEQ", "BNE", "BLT", "BGE", "BLTU", "BGEU"],
-        "LOAD_ANY": ["LB", "LH", "LW", "LBU", "LHU"],
-        "STORE_ANY": ["SB", "SH", "SW"],
-        "JUMP": ["JAL", "JALR"]
-    }
+        "ALU_IMM": [
+            "ADDI",
+            "SLTI",
+            "SLTIU",
+            "XORI",
+            "ORI",
+            "ANDI",
+            "SLLI",
+            "SRLI_SRAI"
+        ],
+        "ALU_REG": [
+            "ADD_SUB",
+            "SLL",
+            "SLT",
+            "SLTU",
+            "XOR",
+            "SRL_SRA",
+            "OR",
+            "AND"
+        ],
+        "BRANCH_ANY": [
+            "BEQ",
+            "BNE",
+            "BLT",
+            "BGE",
+            "BLTU",
+            "BGEU"
+        ],
+        "LOAD_ANY": [
+            "LB",
+            "LH",
+            "LW",
+            "LBU",
+            "LHU"
+        ],
+        "STORE_ANY": [
+            "SB",
+            "SH",
+            "SW"
+        ],
+        "JUMP": [
+            "JAL",
+            "JALR"
+        ]
+    },
+    "primary_signal_names": [
+        "IR1_2",
+        "IR1_3",
+        "IR2_0",
+        "IR2_1",
+        "IR2_2"
+    ],
+    "secondary_signal_names": [
+        "IR4_0",
+        "IR4_1",
+        "IR4_2"
+    ]
 }

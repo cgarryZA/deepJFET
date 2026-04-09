@@ -161,7 +161,8 @@ def decode_nbits(bits, prefix, gates):
 
 
 def generate_decoder(primary_bits, instruction_map, secondary_bits=None,
-                     secondary_map=None, group_map=None):
+                     secondary_map=None, group_map=None,
+                     primary_signal_names=None, secondary_signal_names=None):
     """Generate instruction decoder.
 
     Args:
@@ -175,15 +176,19 @@ def generate_decoder(primary_bits, instruction_map, secondary_bits=None,
     Gate._counter = 0
     gates = []
 
-    # Create input nets
-    ir1 = [Net(f"IR1_{i}") for i in range(primary_bits)]
+    # Create input nets with custom or default names
+    if primary_signal_names:
+        ir1 = [Net(name) for name in primary_signal_names]
+    else:
+        ir1 = [Net(f"IR1_{i}") for i in range(primary_bits)]
 
-    # Inverted copies (useful as outputs)
+    # Inverted copies — use unique internal names to avoid clashing
+    # with register inverted outputs that share the same net name
     ir1_inv = []
     for i in range(primary_bits):
         inv_out, g = inv(ir1[i])
         gates.append(g)
-        inv_out.name = f"!IR1_{i}"
+        inv_out.name = f"dec_inv_{ir1[i].name}"
         ir1_inv.append(inv_out)
 
     # Primary decode using pair structure
@@ -212,13 +217,16 @@ def generate_decoder(primary_bits, instruction_map, secondary_bits=None,
 
     # Secondary decode (if provided)
     if secondary_bits and secondary_map:
-        ir2 = [Net(f"IR2_{i}") for i in range(secondary_bits)]
+        if secondary_signal_names:
+            ir2 = [Net(name) for name in secondary_signal_names]
+        else:
+            ir2 = [Net(f"IR2_{i}") for i in range(secondary_bits)]
 
         ir2_inv = []
         for i in range(secondary_bits):
             inv_out, g = inv(ir2[i])
             gates.append(g)
-            inv_out.name = f"!IR2_{i}"
+            inv_out.name = f"dec_inv_{ir2[i].name}"
             ir2_inv.append(inv_out)
 
         # Secondary pair decoders
@@ -483,6 +491,8 @@ def main():
         sec_map = {(int(k.split(",")[0]), int(k.split(",")[1])): v
                    for k, v in data.get("secondary", {}).items()} if "secondary" in data else None
         grp_map = data.get("groups")
+        pri_sig_names = data.get("primary_signal_names")
+        sec_sig_names = data.get("secondary_signal_names")
     else:
         print("Specify --preset or --bits + --map")
         return
@@ -490,8 +500,13 @@ def main():
     print(f"Generating decoder: {pri_bits}-bit primary" +
           (f" + {sec_bits}-bit secondary" if sec_bits else ""))
 
+    pri_sig_names = locals().get("pri_sig_names")
+    sec_sig_names = locals().get("sec_sig_names")
+
     inputs, outputs, gates = generate_decoder(
-        pri_bits, pri_map, sec_bits, sec_map, grp_map)
+        pri_bits, pri_map, sec_bits, sec_map, grp_map,
+        primary_signal_names=pri_sig_names,
+        secondary_signal_names=sec_sig_names)
 
     # Add FIM/SRC/FIN/JIN for 4004 preset
     if args.preset == "4004":
