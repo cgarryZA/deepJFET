@@ -126,11 +126,12 @@ def decode_nbits(bits, prefix, gates):
     """
     n = len(bits)
 
-    # Pad to even
+    # Pad to even — dummy bit must be explicitly tied LOW
     if n % 2 == 1:
-        # Add a dummy bit tied low (always 0)
         dummy = Net(f"{prefix}_pad")
-        # dummy is never driven — treated as always-low
+        # The pad net needs to be driven LOW externally or via a tie-off gate.
+        # We create an inverter driven by VDD (always high -> output always low)
+        # Actually simpler: just note it needs tying. The placer/test will add it.
         bits = list(bits) + [dummy]
         n += 1
 
@@ -431,10 +432,25 @@ def add_fim_src_fin_jin(inputs, outputs, gates):
 # ── Output ───────────────────────────────────────────────────────────────
 
 def write_netlist(inputs, outputs, gates, filepath):
+    # Collect all pad nets that need tying to VSS
+    pad_nets = set()
+    for g in gates:
+        for inp in g.inputs:
+            if "_pad" in inp.name:
+                pad_nets.add(inp.name)
+
     with open(filepath, "w") as f:
         f.write(f"* Instruction Decoder (NAND2 mux)\n")
         f.write(f"* Gates: {len(gates)}\n")
-        f.write(f"* Outputs: {len(outputs)}\n\n")
+        f.write(f"* Outputs: {len(outputs)}\n")
+        if pad_nets:
+            f.write(f"* Pad nets tied to VSS: {', '.join(sorted(pad_nets))}\n")
+        f.write("\n")
+
+        # Tie pad nets to VSS
+        for pad in sorted(pad_nets):
+            f.write(f"V_tie_{pad} {pad} 0 {{VSS}}\n")
+
         type_map = {"INV": "INV", "NAND2": "NAND2", "NOR2": "NOR2"}
         for g in gates:
             subckt = type_map.get(g.gate_type, g.gate_type)
