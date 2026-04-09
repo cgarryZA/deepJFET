@@ -1,0 +1,1 @@
+V(nop) V(jcn) V(fim) V(src) V(fin) V(jun) V(jin) V(jms) V(inc) V(isz) V(add) V(sub) V(ld) V(ldm) V(xch) V(bbl) V(ldm) V(wr) V(sbm) V(adm) V(rd) V(clb) V(clc) V(iac) V(cmc) V(cma) V(ral) V(rar) V(tcc) V(dac) V(tcs) V(stc) V(daa) V(kbp) V(dcl)

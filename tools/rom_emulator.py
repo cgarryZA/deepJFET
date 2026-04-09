@@ -46,14 +46,16 @@ V_LOW = -3.6    # Logic 0
 
 # Timing
 CLK_PERIOD = 10e-6       # 10 microseconds
-# Per-instruction phase counts (from micro_instructions.asc analysis)
-# Total CLK periods per instruction cycle, including M1-M5 fetch phases.
+# Per-instruction clock cycle counts.
+# 1-word instructions do: micro 1-2-3-4-5 then execute phases.
+# 2-word instructions do: micro 1-2-3-4-5 then 6-7 then 1-2-3-4-5 again for byte 2.
+# The number here is total clock cycles for the full instruction.
 INST_PHASES = {
-    # 6 phases (60us)
+    # 6 cycles
     0xFC: 6,   # KBP
 
-    # 7 phases (70us)
-    0xD0: 7,   # LDM (0xD0-0xDF all LDM)
+    # 7 cycles
+    0xD0: 7,   # LDM
     0xF0: 7,   # CLB
     0xF1: 7,   # CLC
     0xF3: 7,   # CMC
@@ -62,10 +64,10 @@ INST_PHASES = {
     0xFA: 7,   # STC
     0xFD: 7,   # DCL
 
-    # 8 phases (80us)
+    # 8 cycles
     0x00: 8,   # NOP
-    0xA0: 8,   # LD (0xA0-0xAF)
-    0xC0: 8,   # BBL (0xC0-0xCF)
+    0xA0: 8,   # LD
+    0xC0: 8,   # BBL
     0xF2: 8,   # IAC
     0xF5: 8,   # RAL
     0xF6: 8,   # RAR
@@ -73,29 +75,44 @@ INST_PHASES = {
     0xF8: 8,   # DAC
     0xFB: 8,   # DAA
 
-    # 9 phases (90us)
-    0x60: 9,   # INC (0x60-0x6F)
-    0x90: 9,   # SUB (0x90-0x9F)
+    # 9 cycles
+    0x60: 9,   # INC
+    0x80: 9,   # ADD
+    0x90: 9,   # SUB
     0xE8: 9,   # SBM
     0xEB: 9,   # ADM
-    # SRC, FIN, JIN also 9 but they're special (0x2R1, 0x3R0, 0x3R1)
 
-    # 10 phases (100us)
-    0xB0: 10,  # XCH (0xB0-0xBF)
+    # 10 cycles
+    0xB0: 10,  # XCH
 
-    # 11 phases (110us)
-    0x50: 11,  # JMS (0x50-0x5F) — 2-word
+    # 15 cycles (2-word: 7 + 8 fetch phases)
+    0x10: 15,  # JCN
 
-    # 12 phases (120us)
-    0x80: 12,  # ADD (0x80-0x8F)
-    0x70: 12,  # ISZ (0x70-0x7F) — 2-word
+    # 16 cycles (2-word: 7 + 9 or similar)
+    0x20: 16,  # FIM (when even OPA)
+    0x30: 16,  # FIN (when even OPA), JIN (when odd OPA)
+    0x40: 16,  # JUN
+
+    # 18 cycles (2-word)
+    0x50: 18,  # JMS
+    0x70: 18,  # ISZ
+
+    # I/O: WR/RD variants = 8, SRC = 9
+    0xE0: 8,   # WRM
+    0xE1: 8,   # WMP
+    0xE2: 8,   # WRR
+    0xE4: 8,   # WR0
+    0xE5: 8,   # WR1
+    0xE6: 8,   # WR2
+    0xE7: 8,   # WR3
+    0xE9: 8,   # RDM
+    0xEA: 8,   # RDR
+    0xEC: 8,   # RD0
+    0xED: 8,   # RD1
+    0xEE: 8,   # RD2
+    0xEF: 8,   # RD3
 }
 
-# 2-word instructions (need second byte fetch)
-# JCN=0x1x, FIM=0x2x0, JUN=0x4x, JMS=0x5x, ISZ=0x7x
-# Their phase count already includes the second fetch cycle.
-
-# Default for I/O instructions not listed: 9 phases
 DEFAULT_PHASES = 8
 RISE_TIME = 100e-9        # 100ns rise/fall for PWL transitions
 
@@ -115,10 +132,19 @@ ROMCLK_LEAD = 5e-6       # Must be enough for JFET+OR gate propagation (~3-5us)
 # After two iterations of comparison, the correct offsets are:
 #   Phase 5 (0-indexed) = Micro6 timing for OPR
 #   Phase 6 (0-indexed) = Micro7 timing for OPA
+# Byte 1 fetch: IR1 loads during Micro4, IR2 loads during Micro5.
+# The data must propagate through the JFET+OR gate chain (~5us) before
+# the IR latches it. So we present data one phase early:
+#   OPR data at phase 4 (0-indexed) -> settles during Micro4->5 transition
+#   OPA data at phase 5 (0-indexed) -> settles during Micro5->6 transition
+# This was verified working at 94% match on Load5.
 FETCH_PHASE_OPR = 5       # Data arrives during Micro5->Micro6 boundary
 FETCH_PHASE_OPA = 6       # Data arrives during Micro6->Micro7 boundary
-FETCH_PHASE_OPR2 = 13     # Second byte high nibble
-FETCH_PHASE_OPA2 = 14     # Second byte low nibble
+# Byte 2 fetch (2-word instructions): after Micro6-7, counter resets,
+# then Micro1-3 (address), Micro4 loads IR3, Micro5 loads IR4.
+# = 7 phases from instruction start + 5,6 = phases 12,13
+FETCH_PHASE_OPR2 = 12     # IR3 (second byte OPR)
+FETCH_PHASE_OPA2 = 13     # IR4 (second byte OPA)
 
 
 # ── Assembler (simplified, reuses logic from Assembler.py) ──────────────
@@ -445,10 +471,10 @@ class CPU4004Sim:
 # ── PWL Generation ──────────────────────────────────────────────────────
 
 def get_phase_count(opcode: int) -> int:
-    """Get the number of CLK phases for an instruction."""
-    opr = (opcode >> 4) & 0xF
+    """Get the number of CLK cycles for an instruction."""
+    opa = opcode & 0xF
 
-    # Check exact match first (for accumulator group instructions)
+    # Check exact match first (for accumulator/IO group)
     if opcode in INST_PHASES:
         return INST_PHASES[opcode]
 
@@ -457,14 +483,14 @@ def get_phase_count(opcode: int) -> int:
     if base in INST_PHASES:
         return INST_PHASES[base]
 
-    # Special cases by OPR
-    if opr == 0x1:  return 8   # JCN — 8 phases per word, but 2 words
-    if opr == 0x2:  return 9   # FIM/SRC
-    if opr == 0x3:  return 9   # FIN/JIN
-    if opr == 0x4:  return 9   # JUN — 2-word but 9 phases total
+    # Special: SRC = 0x2R1 (odd OPA) = 9 cycles, FIM = 0x2R0 (even OPA) = 16 cycles
+    opr = (opcode >> 4) & 0xF
+    if opr == 0x2:
+        return 9 if (opa & 1) else 16  # SRC=9, FIM=16
 
-    # I/O instructions (0xE0-0xEF) not already matched
-    if opr == 0xE:  return 9
+    # Special: JIN = 0x3R1 (odd OPA) = 16 cycles, FIN = 0x3R0 (even OPA) = 16 cycles
+    if opr == 0x3:
+        return 16
 
     return DEFAULT_PHASES
 
