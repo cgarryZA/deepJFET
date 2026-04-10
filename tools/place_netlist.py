@@ -35,8 +35,8 @@ GATE_FILES = {
 }
 
 # Grid spacing
-CELL_W = 500   # X spacing between gates
-CELL_H = 600   # Y spacing between gates
+CELL_W = 512   # X spacing between gates (must be multiple of 16 for LTSpice grid)
+CELL_H = 608   # Y spacing between gates (must be multiple of 16 for LTSpice grid)
 
 
 def parse_netlist(path):

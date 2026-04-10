@@ -200,30 +200,46 @@ def generate_decoder(primary_bits, instruction_map, secondary_bits=None,
         sec_prefixes = ["2Lower", "2Upper", "2Upper2", "2Upper3"]
         sec_decoders = build_pair_decoders(ir2, ir2_inv, sec_prefixes, gates)
 
+        # Group secondary instructions by their primary opcode value,
+        # then use the already-decoded primary output (not a re-decode)
+        from collections import defaultdict
+        sec_by_primary = defaultdict(list)
         for (pri_val, sec_val), name in secondary_map.items():
-            # Primary match
-            pri_sels = []
-            idx = 0
-            for dec in pri_decoders:
-                n_dec = len(dec); bits_used = 1 if n_dec == 2 else 2
-                val = (pri_val >> idx) & (n_dec - 1)
-                pri_sels.append(dec[val])
-                idx += bits_used
-            pri_match = and_tree(pri_sels, gates)
+            sec_by_primary[pri_val].append((sec_val, name))
 
-            # Secondary match
-            sec_sels = []
-            idx = 0
-            for dec in sec_decoders:
-                n_dec = len(dec); bits_used = 1 if n_dec == 2 else 2
-                val = (sec_val >> idx) & (n_dec - 1)
-                sec_sels.append(dec[val])
-                idx += bits_used
-            sec_match = and_tree(sec_sels, gates)
+        for pri_val, sec_entries in sec_by_primary.items():
+            # Find the primary output for this opcode
+            pri_output = None
+            for opcode, pri_name in instruction_map.items():
+                if opcode == pri_val:
+                    pri_output = outputs[pri_name]
+                    break
 
-            out, gs = and2(pri_match, sec_match); gates.extend(gs)
-            out.name = name
-            outputs[name] = out
+            if pri_output is None:
+                # Primary opcode not in instruction_map — decode it fresh
+                pri_sels = []
+                idx = 0
+                for dec in pri_decoders:
+                    n_dec = len(dec); bits_used = 1 if n_dec == 2 else 2
+                    val = (pri_val >> idx) & (n_dec - 1)
+                    pri_sels.append(dec[val])
+                    idx += bits_used
+                pri_output = and_tree(pri_sels, gates)
+
+            # Each secondary instruction = primary_output AND funct3_match
+            for sec_val, name in sec_entries:
+                sec_sels = []
+                idx = 0
+                for dec in sec_decoders:
+                    n_dec = len(dec); bits_used = 1 if n_dec == 2 else 2
+                    val = (sec_val >> idx) & (n_dec - 1)
+                    sec_sels.append(dec[val])
+                    idx += bits_used
+                sec_match = and_tree(sec_sels, gates)
+
+                out, gs = and2(pri_output, sec_match); gates.extend(gs)
+                out.name = name
+                outputs[name] = out
 
     # Group signals
     if group_map:
