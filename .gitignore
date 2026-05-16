@@ -1,14 +1,56 @@
+# ── Python ──────────────────────────────────────────────────────────────
 __pycache__/
 *.pyc
+
+# ── SQLite (optimization/results.db etc.) ───────────────────────────────
 *.db
 *.db-shm
 *.db-wal
-*.bin
-ltspice/output/
-# Generated CPU schematics (rebuilt by build_cpu.py)
-cpus/4004/4004.asc
-cpus/4004/Load5_test.asc
+
+# ── LTspice transient/operating-point artifacts (regenerated locally) ───
 *.raw
 *.op.raw
 *.log
 *.net
+*.bin
+
+# Programs ship their .asm and PWLs; .raw output stays local
+cpus/**/programs/**/*.raw
+cpus/**/programs/**/*_extracted*.raw
+cpus/**/programs/**/Machine.bin
+cpus/**/programs/**/Machine.hex
+
+# ── Generated CPU schematics (rebuilt by build_cpu.py) ──────────────────
+cpus/4004/4004.asc
+cpus/4004/Load5_test.asc
+
+# ── ltspice export sandbox ──────────────────────────────────────────────
+ltspice/output/
+
+# ── LaTeX build intermediates ───────────────────────────────────────────
+paper/*.aux
+paper/*.bbl
+paper/*.bcf
+paper/*.blg
+paper/*.log
+paper/*.out
+paper/*.run.xml
+paper/*.synctex.gz
+paper/*.toc
+paper/jxcdc/*.aux
+paper/jxcdc/*.bbl
+paper/jxcdc/*.bcf
+paper/jxcdc/*.blg
+paper/jxcdc/*.log
+paper/jxcdc/*.out
+paper/jxcdc/*.run.xml
+
+# ── Editor / OS clutter ─────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+
+# ── Claude Code session state ───────────────────────────────────────────
+.claude/worktrees/
+.claude/scheduled_tasks.lock
+.claude/settings.local.json

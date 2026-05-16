@@ -29,7 +29,14 @@ NEEDED_SIGNALS = (
     [f"v(index{i})" for i in range(4)] +
     ["v(indexreg_loading)", "v(indexreg_load)"] +
     [f"v(scratch{i:03b})" for i in range(8)] +  # Scratch000-Scratch111
-    ["v(cf_out)", "v(cf_inv)"]
+    ["v(cf_out)", "v(cf_inv)"] +
+    # Full carry path: SUMCF -> CFStage1 -> CFInput -> CF0
+    ["v(sumcf)", "v(sumcf_o)",
+     "v(cfstage1_load)", "v(cfstage1_loading)",
+     "v(cf_output)", "v(cfinput)", "v(!cfinput)",
+     "v(cf_load)", "v(cf_loading)", "v(!cf_loading)",
+     "v(cf_clear)", "v(cf_clearing)", "v(!cf_clearing)",
+     "v(!cf0)", "v(cf_bus_load)", "v(cf_bus_loading)"]
 )
 
 

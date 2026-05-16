@@ -238,7 +238,11 @@ def main():
     # Sample at 95% through each phase
     def state_at_edge(i):
         e = m1_edges[i]; ne = m1_edges[i+1] if i+1 < len(m1_edges) else raw.n_points - 1
-        pt = e + int(0.95 * (ne - e))
+        # Sample just past the NEXT instruction's micro1 edge. By this point:
+        # - This instruction's CF_Load at its last CLK has settled CF0
+        # - The next instruction's fetch hasn't yet modified ACC/regs (those
+        #   only change in execute phases Micro 6+)
+        pt = ne + 3  # ~30ns past next micro1 edge
         if pt >= raw.n_points: pt = raw.n_points - 1
         return {
             'time': raw.times[pt],
