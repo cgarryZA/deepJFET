@@ -1,0 +1,70 @@
+% Shared preamble for the deepJFET manuscript.
+%
+% Both Main.tex (full journal version) and Main_JXCDC.tex (compressed
+% 4-8 page JXCDC variant) input this file. Variant-specific behaviour is
+% selected via the \ifjxcdc boolean: the variant master file sets
+% \jxcdctrue or \jxcdcfalse BEFORE \input{preamble}, and body.tex
+% guards heavy figures and verbose subsystem prose with \ifjxcdc.
+
+\usepackage{pgf,pgfarrows,pgfnodes,pgfautomata,pgfheaps}
+\usepackage{graphicx}
+\usepackage[T1]{fontenc}
+\usepackage{gensymb}
+\usepackage{amsfonts}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{float}
+\usepackage{scalefnt}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage[backend=biber, style=ieee, sorting=none]{biblatex}
+\usepackage{comment}
+\usepackage[colorlinks=true, linkcolor=black, urlcolor=black, citecolor=black]{hyperref}
+\usepackage{multicol}
+\usepackage{subcaption}
+
+\addbibresource{bib.bib}
+\addbibresource{bib2.bib}
+
+% Auto-generated macros (transistor counts etc.) from tools/count_transistors.py.
+% Re-run paper/regen_data.py after editing the CPU schematics.
+\input{data/transistor_count_macros}
+
+% Defaults for trace-diff macros so the validation table still compiles
+% before tools/trace_synced.py has been run end-to-end. After the
+% LTspice runs complete, paper/regen_data.py runs trace_synced.py which
+% writes data/trace_diff_<Program>_macros.tex and overrides these.
+\providecommand{\TraceCyclesFloatingPoint}{TBD}
+\providecommand{\TraceDivergencesFloatingPoint}{TBD}
+\providecommand{\TraceCyclesBitwiseAND}{TBD}
+\providecommand{\TraceDivergencesBitwiseAND}{TBD}
+\IfFileExists{data/trace_diff_FloatingPoint_macros.tex}{\input{data/trace_diff_FloatingPoint_macros}}{}
+\IfFileExists{data/trace_diff_BitwiseAND_macros.tex}{\input{data/trace_diff_BitwiseAND_macros}}{}
+
+% Listing style for the assembly code.
+\lstset{
+    basicstyle=\ttfamily\scriptsize,
+    columns=fullflexible,
+    breaklines=true,
+    postbreak=\mbox{\textcolor{red}{$\hookrightarrow$}\space},
+    numbers=left,
+    numberstyle=\tiny\color{gray},
+    keywordstyle=\color{blue},
+    commentstyle=\color{green},
+    stringstyle=\color{orange},
+    frame=single,
+    rulecolor=\color{black},
+    captionpos=b,
+    xleftmargin=10pt,
+    escapeinside={(*@}{@*)},
+}
+
+% Shared title + author block. Both variants use the same title for now;
+% variant master files can override these AFTER \input{preamble} if
+% needed.
+\title{Transistor-Level Design and Validation of a Silicon-Carbide JFET Intel-4004-Compatible 4-bit Processor}
+\author{Christian Garry\IEEEauthorrefmark{1} and Alton Horsfall\IEEEauthorrefmark{2}%
+\thanks{C.~Garry and A.~Horsfall are with the Department of Engineering, Durham University, Durham, UK.}%
+\thanks{\IEEEauthorrefmark{1}C.~Garry: ORCID 0009-0001-3931-9401.}%
+\thanks{\IEEEauthorrefmark{2}A.~Horsfall: ORCID 0000-0003-2772-2006.}}
+\date{}

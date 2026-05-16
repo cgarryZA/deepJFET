@@ -1,0 +1,66 @@
+Creative Commons Attribution 4.0 International (CC-BY-4.0)
+
+Copyright (c) 2024-2026 Christian Garry and Alton Horsfall
+
+This licence applies to the manuscript portion of the deepJFET
+repository, specifically:
+
+  paper/Main.tex
+  paper/Appendices.tex
+  paper/AppendixB.tex
+  paper/AppendixC.tex
+  paper/supplementary/*.tex
+  paper/Images/*
+  paper/Appendices/*
+  paper/bib.bib
+  paper/bib2.bib
+  paper/data/*               (auto-generated tables; see file headers)
+  paper/BIBLIOGRAPHY_TODO.md
+  paper/VENUE_TAILORING_TODO.md
+  paper/reproducibility/README.md
+  paper/CITATION.cff
+  paper/.zenodo.json
+
+The software portion of the repository (Python scripts, .cir testbench
+generators, build pipeline) is licensed separately under the MIT licence;
+see the LICENSE file at the repository root.
+
+You are free to:
+
+  Share   - copy and redistribute the material in any medium or format
+  Adapt   - remix, transform, and build upon the material for any
+            purpose, even commercially
+
+under the following terms:
+
+  Attribution - You must give appropriate credit, provide a link to the
+                licence, and indicate if changes were made. You may do so
+                in any reasonable manner, but not in any way that suggests
+                the licensor endorses you or the use.
+
+  No additional restrictions - You may not apply legal terms or
+                technological measures that legally restrict others from
+                doing anything the licence permits.
+
+The full legal text of the Creative Commons Attribution 4.0 International
+licence is available at:
+
+  https://creativecommons.org/licenses/by/4.0/legalcode
+
+A summary deed is at:
+
+  https://creativecommons.org/licenses/by/4.0/
+
+Notices:
+
+You do not have to comply with the licence for elements of the material
+in the public domain or where your use is permitted by an applicable
+exception or limitation. No warranties are given. The licence may not
+give you all of the permissions necessary for your intended use. For
+example, other rights such as publicity, privacy, or moral rights may
+limit how you use the material.
+
+Intel 4004 architecture diagrams reproduced from publicly available
+material (Wikimedia / archive.org / the original MCS-4 manual) remain
+subject to their original copyright terms; their inclusion here is
+under fair-use citation for architectural commentary and reproducibility.

@@ -1,0 +1,38 @@
+{
+    "title": "Transistor-Level Design and Validation of a Silicon-Carbide JFET Intel-4004-Compatible 4-bit Processor",
+    "description": "Reproducibility package for the manuscript of the same title. Contains: the LTspice .asc schematics for every CPU subsystem, the Python reference emulator and register-level co-validation tool (tools/trace_synced.py, tools/rom_emulator.py), the 4004 assembler and test programs (bitwise AND from the MCS-4 manual, 16-bit floating-point multiplication), the LTspice corner-sweep test benches (analysis/sweeps/*.cir), and the build pipeline (paper/build.py) that regenerates every table and figure end to end. Running 'python paper/build.py' from the repository root reproduces the manuscript PDF from source.",
+    "creators": [
+        {
+            "name": "Garry, Christian",
+            "affiliation": "Durham University",
+            "orcid": "0009-0001-3931-9401"
+        },
+        {
+            "name": "Horsfall, Alton",
+            "affiliation": "Durham University",
+            "orcid": "0000-0003-2772-2006"
+        }
+    ],
+    "keywords": [
+        "silicon carbide",
+        "SiC",
+        "JFET",
+        "junction field effect transistor",
+        "microprocessor",
+        "Intel 4004",
+        "extreme environment electronics",
+        "high temperature electronics",
+        "resistor-transistor logic",
+        "RTL",
+        "LTspice",
+        "circuit simulation",
+        "emulator co-validation",
+        "reproducibility"
+    ],
+    "license": "MIT",
+    "upload_type": "software",
+    "access_right": "open",
+    "related_identifiers": [],
+    "communities": [],
+    "notes": "The Zenodo deposit is licensed as software under MIT (this field). The manuscript text, figures, and auto-generated data tables under paper/ are dual-licensed under CC-BY-4.0; see paper/LICENSE-CC-BY-4.0 in the bundle. The package excludes machine-specific LTspice .raw / .log / Machine.bin / Machine.hex files; the README documents how to regenerate those locally. The SiC JFET SPICE parameter card in cpus/4004/config.py was supplied by the project supervisor and appeared in the publicly released MEng report from which this work descends; it is included on that basis, but the underlying device model belongs to its original owner and any redistribution beyond this academic reproducibility package should obtain permission accordingly. See paper/reproducibility/README.md for the full provenance and redistribution notes."
+}

@@ -1,0 +1,38 @@
+cff-version: 1.2.0
+message: "If you use this work, please cite it as below."
+title: "Transistor-Level Design and Validation of a Silicon-Carbide JFET Intel-4004-Compatible 4-bit Processor"
+abstract: >-
+  A transistor-level SiC JFET implementation of an Intel-4004-compatible
+  4-bit microprocessor, captured at the schematic level in LTspice and
+  validated by register-level co-simulation against a Python reference
+  emulator plus measured-versus-simulated agreement of physical NAND
+  and NOR primitive gates from 1 Hz to 1 MHz.
+authors:
+  - family-names: Garry
+    given-names: Christian
+    affiliation: Durham University
+    orcid: "https://orcid.org/0009-0001-3931-9401"
+  - family-names: Horsfall
+    given-names: Alton
+    affiliation: Durham University
+    orcid: "https://orcid.org/0000-0003-2772-2006"
+keywords:
+  - silicon carbide
+  - JFET
+  - microprocessor
+  - Intel 4004
+  - extreme environment electronics
+  - high temperature electronics
+  - resistor-transistor logic
+  - LTspice
+  - emulator co-validation
+type: software
+license: MIT
+# The software (this CITATION.cff applies to) is MIT-licensed.
+# The manuscript text and figures under paper/ are CC-BY-4.0; see
+# paper/LICENSE-CC-BY-4.0 in the repository for that licence text.
+#
+# DOI added after Zenodo mint:
+# identifiers:
+#   - type: doi
+#     value: 10.5281/zenodo.XXXXXXXX

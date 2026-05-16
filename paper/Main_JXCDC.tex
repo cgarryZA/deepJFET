@@ -1,0 +1,23 @@
+% Compressed 4-8 page JXCDC variant of the deepJFET manuscript.
+%
+% Source-shared with Main.tex via preamble.tex and body.tex; the
+% \ifjxcdc boolean below selects which figures and prose are hidden
+% (the full transistor-level subsystem schematics, the verbose
+% subsystem prose, the supporting current-draw and FP-trace figures,
+% and the FP register-value table). Everything else is identical to
+% the master.
+%
+% Build with paper/build.py --variant jxcdc (outputs to paper/jxcdc/).
+
+\documentclass[journal]{IEEEtran}
+
+% Variant switch: JXCDC compressed.
+\newif\ifjxcdc
+\jxcdctrue
+
+\input{preamble}
+
+\begin{document}
+\maketitle
+\input{body}
+\end{document}

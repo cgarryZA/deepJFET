@@ -1,0 +1,13 @@
+\section*{Supplement S1: ALU Carry-Save Race Condition}
+\label{supp:carry-race}
+
+During simulation of the ALU it was observed that the carry flag and the accumulator did not latch their new values simultaneously, producing a race condition. Once the sum was written to the accumulator, the updated value was fed back through the adder and could overwrite the carry register before the carry latch signal returned low. This made it ambiguous whether the value saved in the carry register reflected the original sum operation or a second pass of the new accumulator value through the adder. Reversing the latching order produced the dual problem in the sum output. The fix used in this paper is a two-stage carry flag: the first flip-flop captures the new carry value without affecting the adder input, the sum is then written to the accumulator, and the second carry stage is loaded from the first. This is the cause of the additional flip-flop visible in the ALU schematic.
+
+\section*{Supplement S2: Micro-Instruction Phase Enumeration}
+\label{supp:micro-phases}
+
+The micro-instruction step counter sequences the CPU through three named phases: address ($A_1, A_2, A_3$), memory ($M_1, M_2$), and execute ($X_1, X_2, X_3$). At $A_1$ the CPU emits the middle-order four bits of the program counter onto the external bus; at $A_2$ the low-order four bits; and at $A_3$ the high-order four bits, in the order expected by an Intel 4001 ROM and a 4002 RAM. Once the address has been emitted, the data bus is sampled inwards during $M_1$ and $M_2$, transferring two four-bit halves into the upper word of the instruction register.
+
+If the decoded opcode requires a second word, a flip-flop on the CPU is toggled and the program counter is incremented; on the next fetch cycle the new word is placed into the lower half of the instruction register, leaving sixteen bits ready for execution. The execute phases $X_1, X_2, X_3$ activate the appropriate combination of subsystem control lines according to the micro-instruction ROM. The 4001 ROM mirrors the same phase structure: it captures the address at $A_1$ and $A_2$, decodes its chip-select at $A_3$, emits eight bits of data during $M_1$ and $M_2$, and on a ROM/RAM instruction loads its own instruction register during $X_1$ and performs read- or write-port operations during $X_2$.
+
+This three-step execute window is the architectural reason for the direct point-to-point connection between the program counter and the stack adopted in this implementation. The stack must transfer twelve bits between itself and the program counter, plus update its level-select shift register, within three clock pulses --- a budget that the four-bit shared bus cannot meet.

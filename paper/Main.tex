@@ -1,0 +1,21 @@
+% Master journal-length version (~14 pages) of the deepJFET manuscript.
+%
+% The actual content lives in body.tex; the preamble lives in
+% preamble.tex; the variant-selection boolean \ifjxcdc is set false
+% here so the full schematics and full subsystem prose are included.
+%
+% For the compressed 4-8 page JXCDC variant, see Main_JXCDC.tex which
+% sets \jxcdctrue and otherwise inputs the same files.
+
+\documentclass[journal]{IEEEtran}
+
+% Variant switch: master version, full content.
+\newif\ifjxcdc
+\jxcdcfalse
+
+\input{preamble}
+
+\begin{document}
+\maketitle
+\input{body}
+\end{document}
