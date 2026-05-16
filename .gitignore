@@ -23,6 +23,11 @@ cpus/**/programs/**/Machine.hex
 # ── Generated CPU schematics (rebuilt by build_cpu.py) ──────────────────
 cpus/4004/4004.asc
 cpus/4004/Load5_test.asc
+cpus/simplified/4004.asc
+cpus/simplified/Load5_test.asc
+
+# ── Tileable RV32I generated testbenches (large, regenerated) ───────────
+cpus/tileable/generated/test_rv32i_full/
 
 # ── ltspice export sandbox ──────────────────────────────────────────────
 ltspice/output/
