@@ -77,12 +77,12 @@ INST_PHASES = {
 
     # 9 cycles
     0x60: 9,   # INC
-    0x80: 9,   # ADD
-    0x90: 9,   # SUB
     0xE8: 9,   # SBM
     0xEB: 9,   # ADM
 
     # 10 cycles
+    0x80: 10,  # ADD
+    0x90: 10,  # SUB
     0xB0: 10,  # XCH
 
     # 15 cycles (2-word: 7 + 8 fetch phases)

@@ -1,0 +1,60 @@
+MIT License
+
+Copyright (c) 2024-2026 Christian Garry and Alton Horsfall
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+----------------------------------------------------------------------
+
+Scope of this licence:
+
+This MIT licence covers the *software* portion of the deepJFET repository:
+all Python scripts under tools/, blocks/, model/, simulator/, transient/,
+and optimization/; all build and reproducibility tooling under paper/
+(build.py, regen_data.py, reproducibility/); and the LTspice testbench
+generators and corner-sweep .cir files under analysis/sweeps/.
+
+Other parts of the repository are licensed separately:
+
+  - The manuscript text and figures under paper/ (Main.tex, Appendices.tex,
+    AppendixB.tex, AppendixC.tex, supplementary/*.tex, Images/*, bib.bib,
+    bib2.bib) and the auto-generated data tables under paper/data/* are
+    released under the Creative Commons Attribution 4.0 International
+    licence (CC-BY-4.0). See paper/LICENSE-CC-BY-4.0 for the licence text
+    and https://creativecommons.org/licenses/by/4.0/ for the full deed.
+
+  - The Intel 4004 architecture, the MCS-4 assembly mnemonics, and any
+    waveforms or images derived from Intel-published material remain the
+    intellectual property of their original owners; their inclusion here is
+    for the purpose of architectural commentary and reproducibility.
+
+Not included in this repository (and therefore NOT covered by either
+licence):
+
+  - Any proprietary SiC JFET LTspice device model or model parameter card
+    that is owned by a third party. The Cree/Wolfspeed-style NJF parameters
+    referenced in cpus/4004/config.py are included only to the extent that
+    they appeared in the public MEng report from which this work descends;
+    redistribution of any third-party-owned model card remains subject to
+    the original owner's terms. Users wishing to reproduce the full
+    transistor-level simulations must supply their own compatible SiC
+    JFET model or obtain permission from the relevant model owner.
+
+  - Any confidential netlist, schematic, or simulation result that the
+    authors or Durham University have not explicitly chosen to publish.
