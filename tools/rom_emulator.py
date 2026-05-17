@@ -39,6 +39,9 @@ import sys
 _root = os.path.join(os.path.dirname(__file__), "..")
 PROJECT_ROOT = os.path.abspath(_root)
 sys.path.insert(0, _root)
+sys.path.insert(0, os.path.dirname(__file__))
+
+from ram4002 import RAMState
 
 # Logic voltage levels (from controls.asc)
 V_HIGH = -0.8   # Logic 1
@@ -145,6 +148,14 @@ FETCH_PHASE_OPA = 6       # Data arrives during Micro6->Micro7 boundary
 # = 7 phases from instruction start + 5,6 = phases 12,13
 FETCH_PHASE_OPR2 = 12     # IR3 (second byte OPR)
 FETCH_PHASE_OPA2 = 13     # IR4 (second byte OPA)
+
+# RAM-read instructions (RDM, RD0..3, ADM, SBM, RDR) expect data on
+# D0In..D3In during the X2/X3 micro-cycles (= M7/M8 of the 8-cycle
+# instruction) so the CPU can latch it into ACC. The same JFET+OR-gate
+# propagation delay logic as ROM fetch applies — present one CLK early.
+# Empirically: present at phase 7 (Micro7->Micro8 boundary). Holds
+# through end of cycle.
+RAM_READ_PHASE = 7
 
 
 # ── Assembler (simplified, reuses logic from Assembler.py) ──────────────
@@ -284,6 +295,11 @@ class CPU4004Sim:
         self.regs = [0] * 16
         self.stack = [0, 0, 0]
         self.stack_ptr = 0
+        # Off-CPU 4002 RAM + 4001 ROM-port state. Programs that use SRC,
+        # WRM, RDM, ADM, SBM, WR0..3, RD0..3, WMP, WRR, RDR, DCL all
+        # interact through here. Default state is all-zero, matching a
+        # cold-boot 4002 with no DCL sent (CM-RAM0 / bank 0 selected).
+        self.ram = RAMState()
 
     def fetch_byte(self) -> int:
         if self.pc < len(self.rom):
@@ -300,7 +316,14 @@ class CPU4004Sim:
     def execute_one(self) -> tuple:
         """Execute one instruction.
 
-        Returns (pc_before_fetch, byte1, byte2_or_None, is_two_word).
+        Returns (pc_before_fetch, byte1, byte2_or_None, is_two_word,
+                 ram_read_data).
+
+        `ram_read_data` is None for instructions that don't consume data
+        from the off-CPU data bus during execute (anything that isn't
+        RDM / RD0..3 / ADM / SBM / RDR). For those, it's the 4-bit value
+        the emulator-as-RAM is presenting on D0In..D3In at the X2/X3
+        phase — the same value the CPU will latch into ACC.
         """
         pc_start = self.pc
         b1 = self.fetch_byte()
@@ -309,6 +332,7 @@ class CPU4004Sim:
 
         b2 = None
         two_word = False
+        ram_read_data = None
 
         if opr == 0x0:
             pass  # NOP
@@ -337,7 +361,12 @@ class CPU4004Sim:
             self.regs[pair * 2 + 1] = b2 & 0xF
 
         elif opr == 0x2 and (opa & 1) == 1:
-            pass  # SRC — sends register pair to address bus (no PC change)
+            # SRC — sends the index register pair to the data bus during
+            # X2/X3. RAM/ROM chips watching the bus latch the address.
+            pair = (opa >> 1) & 0x7
+            high = self.regs[pair * 2]      # X2: top 4 bits (chip+reg)
+            low = self.regs[pair * 2 + 1]   # X3: bottom 4 bits (char)
+            self.ram.src_latch(high, low)
 
         elif opr == 0x3 and (opa & 1) == 0:
             pass  # FIN — indirect fetch (complex, skip for now)
@@ -406,18 +435,56 @@ class CPU4004Sim:
             self.acc = opa
 
         elif opr == 0xE:
-            # I/O and RAM — handle accumulator effects
-            if opa == 0x0:   pass  # WRM
-            elif opa == 0x2: pass  # WRR
-            elif opa == 0x8:       # SBM
-                result = self.acc + 0xF + (1 - self.cy)  # complement + borrow
+            # I/O + RAM group. The previously SRC-latched address picks
+            # the target main character / status character / RAM port,
+            # and the previously SRC-latched ROM chip picks the target
+            # ROM port for WRR / RDR.
+            if opa == 0x0:        # WRM   M ← ACC
+                self.ram.write_main(self.acc)
+            elif opa == 0x1:      # WMP   RAM port ← ACC
+                self.ram.write_ram_port(self.acc)
+            elif opa == 0x2:      # WRR   ROM port ← ACC
+                self.ram.write_rom_port(self.acc)
+            elif opa == 0x3:      # WPM (not standard 4004; treat as NOP)
+                pass
+            elif opa == 0x4:      # WR0   MS0 ← ACC
+                self.ram.write_status(0, self.acc)
+            elif opa == 0x5:      # WR1   MS1 ← ACC
+                self.ram.write_status(1, self.acc)
+            elif opa == 0x6:      # WR2   MS2 ← ACC
+                self.ram.write_status(2, self.acc)
+            elif opa == 0x7:      # WR3   MS3 ← ACC
+                self.ram.write_status(3, self.acc)
+            elif opa == 0x8:      # SBM   ACC ← ACC + ~M + CY (1 = no borrow)
+                m = self.ram.read_main()
+                ram_read_data = m
+                result = self.acc + ((~m) & 0xF) + self.cy
                 self.acc = result & 0xF
                 self.cy = 1 if result > 0xF else 0
-            elif opa == 0x9: pass  # RDM — would load from RAM
-            elif opa == 0xB:       # ADM
-                result = self.acc + self.cy  # would add RAM content
+            elif opa == 0x9:      # RDM   ACC ← M
+                ram_read_data = self.ram.read_main()
+                self.acc = ram_read_data
+            elif opa == 0xA:      # RDR   ACC ← ROM input pins
+                ram_read_data = self.ram.read_rom_port()
+                self.acc = ram_read_data
+            elif opa == 0xB:      # ADM   ACC ← ACC + M + CY
+                m = self.ram.read_main()
+                ram_read_data = m
+                result = self.acc + m + self.cy
                 self.acc = result & 0xF
                 self.cy = 1 if result > 0xF else 0
+            elif opa == 0xC:      # RD0   ACC ← MS0
+                ram_read_data = self.ram.read_status(0)
+                self.acc = ram_read_data
+            elif opa == 0xD:      # RD1   ACC ← MS1
+                ram_read_data = self.ram.read_status(1)
+                self.acc = ram_read_data
+            elif opa == 0xE:      # RD2   ACC ← MS2
+                ram_read_data = self.ram.read_status(2)
+                self.acc = ram_read_data
+            elif opa == 0xF:      # RD3   ACC ← MS3
+                ram_read_data = self.ram.read_status(3)
+                self.acc = ram_read_data
 
         elif opr == 0xF:
             # Accumulator group
@@ -462,10 +529,10 @@ class CPU4004Sim:
             elif opa == 0xC:  # KBP
                 kbp = {0:0, 1:1, 2:2, 4:3, 8:4}
                 self.acc = kbp.get(self.acc, 0xF)
-            elif opa == 0xD:  # DCL
-                pass
+            elif opa == 0xD:  # DCL — bottom 3 ACC bits select RAM bank
+                self.ram.dcl(self.acc)
 
-        return pc_start, b1, b2, two_word
+        return pc_start, b1, b2, two_word, ram_read_data
 
 
 # ── PWL Generation ──────────────────────────────────────────────────────
@@ -543,7 +610,7 @@ def generate_pwl(rom: list, num_cycles: int, startup_delay: float = 2e-6,
     trace = []
 
     for cycle in range(num_cycles):
-        pc, b1, b2, two_word = cpu.execute_one()
+        pc, b1, b2, two_word, ram_read_data = cpu.execute_one()
         trace.append((cycle, pc, b1, b2))
 
         n_phases = get_phase_count(b1)
@@ -558,7 +625,16 @@ def generate_pwl(rom: list, num_cycles: int, startup_delay: float = 2e-6,
 
         set_bus(t_opr, opr)
         set_bus(t_opa, opa)
-        set_bus(t_clear1, 0)  # Clear bus (all low)
+        if ram_read_data is not None:
+            # RAM-read instruction (RDM/RDx/ADM/SBM/RDR): the emulator is
+            # standing in for the off-chip 4002/4001 and must drive the
+            # data bus at X2/X3 with the value the CPU expects to latch
+            # into ACC. Skip the bus-clear and present RAM data instead;
+            # it holds through to the next instruction's OPR phase.
+            t_ram = t + (RAM_READ_PHASE * CLK_PERIOD) - ROMCLK_LEAD
+            set_bus(t_ram, ram_read_data)
+        else:
+            set_bus(t_clear1, 0)  # Clear bus (all low)
 
         # Byte 2 for two-word instructions
         if two_word and b2 is not None:

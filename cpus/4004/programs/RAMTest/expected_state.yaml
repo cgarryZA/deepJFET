@@ -1,0 +1,40 @@
+# Reference state for RAMTest — the first program to exercise the
+# off-CPU 4002 RAM bus.
+
+program: RAMTest
+asm: RAMTest.asm
+
+# LTspice DFF power-up state.
+powerup:
+  acc:  15
+  cy:   0
+  regs: [15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15]
+  ram_main: zero-initialised
+  ram_status: zero-initialised
+  ram_bank: 0     # default after RESET, no DCL issued
+
+# Sync point for trace_synced.py: right after the JUN START + Test 1's
+# four setup instructions have settled (R0=0, R1=5, SRC latched).
+sync:
+  after_cycle: 6
+  acc:  15
+  cy:   0
+  regs: [0, 5, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15]
+
+# Final state at terminating NOP.
+final:
+  halted_at_cycle: 35
+  reason: program reached the terminating NOP after Test 3
+  acc:  15
+  cy:   0
+  regs: [0, 0, 9, 9, 0, 11, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15]
+  # R2 = 9  (Test 1: WRM/RDM round trip)
+  # R3 = 9  (Test 2: ADM 5+4+0 = 9)
+  # R4 = 0  (Test 2: CY captured by TCC = 0)
+  # R5 = 11 (Test 3: WR2/RD2 round trip, 0xB)
+  # R6..R15 = 15 (power-up, never written)
+  ram_main_nonzero:
+    - [bank: 0, chip: 0, reg: 0, char: 5, value: 9]
+    - [bank: 0, chip: 0, reg: 0, char: 7, value: 4]
+  ram_status_nonzero:
+    - [bank: 0, chip: 0, reg: 0, status: 2, value: 11]
