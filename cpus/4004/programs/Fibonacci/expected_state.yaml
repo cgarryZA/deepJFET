@@ -1,0 +1,29 @@
+# Hand-curated reference state for Fibonacci.
+# Matches the Python emulator output (rom_emulator.CPU4004Sim) when run
+# with the same DFF power-up assumption as BitwiseAND.
+
+program: Fibonacci
+asm: Fibonacci.asm
+
+# Power-up state of the LTspice DFFs at t=0.
+powerup:
+  acc:  15
+  cy:   0
+  regs: [15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15]
+
+# Sync point for tools/trace_synced.py — state right after the four
+# setup instructions land (LDM 0; XCH 0; LDM 1; XCH 1).
+sync:
+  after_cycle: 5
+  acc:  15
+  cy:   0
+  regs: [0, 1, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15]
+
+# Final state when the program halts at the terminating NOP.
+final:
+  halted_at_cycle: 28
+  reason: BBL 0 returned to terminating NOP, all 8 Fibonacci numbers computed
+  acc:  0
+  cy:   0
+  regs: [0, 1, 1, 2, 3, 5, 8, 13, 15, 15, 15, 15, 15, 15, 15, 15]
+  # R0..R7 = F(0)..F(7), R8..R15 = power-up state (untouched)
