@@ -62,18 +62,18 @@ GENERATORS = [
     # transient sim.
     {
         "key":   "trace_fp",
-        "label": "Register-level emulator diff (FloatingPoint, --resync never)",
-        "cmd":   [sys.executable, str(TOOLS / "trace_synced.py"),
+        "label": "ISA-rule verification of LTspice trace (FloatingPoint)",
+        "cmd":   [sys.executable, str(TOOLS / "verify_micro5.py"),
                   "--program", "FloatingPoint",
-                  "--resync", "never", "--quiet"],
+                  "--start-time", "4", "--quiet"],
         "requires": PROGRAMS / "FloatingPoint" / "SIM_COMPLETE",
     },
     {
         "key":   "trace_and",
-        "label": "Register-level emulator diff (BitwiseAND, --resync never)",
-        "cmd":   [sys.executable, str(TOOLS / "trace_synced.py"),
+        "label": "ISA-rule verification of LTspice trace (BitwiseAND)",
+        "cmd":   [sys.executable, str(TOOLS / "verify_micro5.py"),
                   "--program", "BitwiseAND",
-                  "--resync", "never", "--quiet"],
+                  "--start-time", "0.2", "--quiet"],
         "requires": PROGRAMS / "BitwiseAND" / "SIM_COMPLETE",
     },
     # Week 4 LTspice-driven corner analysis. These ANALYZE the .log

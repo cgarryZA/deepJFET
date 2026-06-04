@@ -3,6 +3,28 @@
 Hand-designed gate parameters for the SiC JFET implementation of the
 Intel 4004 architecture. Modify R values here to tune individual gate
 types without affecting the rest of the design.
+
+Two JFET parameterisations are maintained side-by-side:
+
+  JFET_MODEL_SUPPLIER_v1     — proprietary supplier parameter card.
+                                Validated baseline at 27 °C; used for
+                                all results in the current manuscript.
+  JFET_MODEL_NEUDECK_2016    — public NASA Glenn parameter card from
+                                Neudeck, Spry, Chen 2016. Used for the
+                                temperature-sweep extension and for any
+                                fully-reproducible-from-public-sources
+                                manuscript variant.
+
+The active model (the bound name `JFET_MODEL`) is selected by the
+environment variable `JFET_MODEL`:
+
+    JFET_MODEL=supplier  python tools/build_cpu.py 4004   # default
+    JFET_MODEL=neudeck   python tools/build_cpu.py 4004
+
+This lets the existing supplier-model results in the current paper be
+reproduced from this repo at any time without committing a model
+swap, while the new temperature-sweep campaign can run with a
+publicly-citable card by setting the env var.
 """
 
 import sys, os
@@ -10,13 +32,57 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from model import NChannelJFET, JFETCapacitance
 
-# -- JFET device model (DR NJF from SPICE .model card) --
-JFET_MODEL = NChannelJFET(
+# ── Supplier-provided proprietary parameterisation (current paper) ──────
+#
+# The DR-NJF card from the project's supplier SPICE deck. Validated
+# baseline; not redistributable beyond academic reproduction of this
+# work (see paper/reproducibility/README.md for the provenance
+# statement).
+JFET_MODEL_SUPPLIER_v1 = NChannelJFET(
     beta=0.000135, vto=-3.45, lmbda=0.005,
     is_=205.2e-15, n=3.0, isr=1988e-15, nr=4.0,
     alpha=20.98e-6, vk=123.7, rd=1.0, rs=1.0,
     betatce=-0.5, vtotc=-0.0025, xti=3.0, eg=3.26,
 )
+
+# ── Public NASA Glenn parameterisation (Neudeck/Spry/Chen 2016) ─────────
+#
+# *** PLACEHOLDER — pending paper acquisition ***
+#
+# Source: P. Neudeck, D. Spry, L. Chen, "First-Order SPICE Modeling of
+# Extreme-Temperature 4H-SiC JFET Integrated Circuits", NASA Glenn
+# Research Center, ~2016. Semantic Scholar paper ID:
+#   81183fea1000d3f2ddee9c14fd3402ceaa70c5b5
+#
+# Values below are TBD; the supplier card is duplicated here as a
+# stand-in so the module still imports cleanly. Replace with the
+# real Neudeck parameters once the model card has been extracted
+# from the paper's text / supplementary deck.
+JFET_MODEL_NEUDECK_2016 = NChannelJFET(
+    beta=0.000135, vto=-3.45, lmbda=0.005,   # TBD: from Neudeck 2016
+    is_=205.2e-15, n=3.0, isr=1988e-15, nr=4.0,   # TBD
+    alpha=20.98e-6, vk=123.7, rd=1.0, rs=1.0,   # TBD
+    betatce=-0.5, vtotc=-0.0025, xti=3.0, eg=3.26,   # TBD
+)
+# The temperature range the Neudeck card has been validated against
+# (from the originating paper). Used by tools/temperature_sweep.py to
+# refuse runs outside the device's qualified range. Update once the
+# paper is acquired.
+JFET_MODEL_NEUDECK_2016_VALIDATED_RANGE_C = (None, None)  # TBD: (Tmin, Tmax)
+
+# ── Active selection ────────────────────────────────────────────────────
+_MODEL_NAME = os.environ.get("JFET_MODEL", "supplier").lower()
+if _MODEL_NAME in ("neudeck", "neudeck2016", "neudeck_2016", "nasa"):
+    JFET_MODEL = JFET_MODEL_NEUDECK_2016
+    JFET_MODEL_PROVENANCE = "Neudeck/Spry/Chen 2016 (NASA Glenn, public)"
+elif _MODEL_NAME in ("supplier", "default", "v1", ""):
+    JFET_MODEL = JFET_MODEL_SUPPLIER_v1
+    JFET_MODEL_PROVENANCE = "supplier-provided proprietary v1"
+else:
+    raise ValueError(
+        f"Unknown JFET_MODEL env value {_MODEL_NAME!r}; "
+        f"expected 'supplier' or 'neudeck'"
+    )
 
 # -- Junction capacitances --
 CAPS = JFETCapacitance(cgs0=16.9e-12, cgd0=16.9e-12)

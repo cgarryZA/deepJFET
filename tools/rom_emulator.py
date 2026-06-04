@@ -150,12 +150,31 @@ FETCH_PHASE_OPR2 = 12     # IR3 (second byte OPR)
 FETCH_PHASE_OPA2 = 13     # IR4 (second byte OPA)
 
 # RAM-read instructions (RDM, RD0..3, ADM, SBM, RDR) expect data on
-# D0In..D3In during the X2/X3 micro-cycles (= M7/M8 of the 8-cycle
-# instruction) so the CPU can latch it into ACC. The same JFET+OR-gate
-# propagation delay logic as ROM fetch applies — present one CLK early.
-# Empirically: present at phase 7 (Micro7->Micro8 boundary). Holds
-# through end of cycle.
-RAM_READ_PHASE = 7
+# D0In..D3In during Micro7, which is when the schematic's `Acc_Load`
+# strobe fires (it's the AND of the decoded RD signal and the Micro7
+# phase — see controls.asc).
+#
+# In our phase-index numbering, phase 6 corresponds to Micro7. But we
+# CAN'T put RAM data at phase 6: that's where OPA is on the bus, and
+# IR2 needs to latch OPA at the start of Micro7 to decode the
+# instruction correctly. If we overwrote OPA with RAM data (e.g.
+# ADM's OPA=B with RAM contents 4), IR2 would decode 0xE4 = WR0
+# instead of 0xEB = ADM. Decoder breaks.
+#
+# The fix: transition the bus mid-Micro7. Keep OPA at the start of
+# Micro7 (phase 6) so IR2 latches it correctly, then switch to RAM
+# data at phase 6.5 (half a CLK later, still well within Micro7) so
+# `Acc_Load` catches the RAM data when it strobes. Bus then holds
+# RAM data through phase 7 (Micro8) which is the existing clear-bus
+# phase for non-RAM instructions.
+#
+# Empirical evidence this was wrong before: RAMTest (35-instruction
+# program with three round-trip RAM tests) showed R2, R3, R4, R5 all
+# stayed at DFF power-up (F) instead of getting their expected
+# transferred values 9, 9, 0, B. With RAM_READ_PHASE = 7, the RAM
+# data only arrived AFTER Acc_Load had already strobed in Micro7 with
+# OPA on the bus.
+RAM_READ_PHASE = 6.5
 
 
 # ── Assembler (simplified, reuses logic from Assembler.py) ──────────────
@@ -568,7 +587,8 @@ def bit_voltage(byte_val: int, bit: int) -> float:
 
 
 def generate_pwl(rom: list, num_cycles: int, startup_delay: float = 2e-6,
-                 start_address: int = 0) -> dict:
+                 start_address: int = 0,
+                 clock_period_us: float = 10.0) -> tuple:
     """Generate PWL waveforms for D0In-D3In by simulating program execution.
 
     PWL files use proper step transitions: each value change is a pair of
@@ -578,15 +598,34 @@ def generate_pwl(rom: list, num_cycles: int, startup_delay: float = 2e-6,
     Args:
         rom: assembled ROM image (list of bytes)
         num_cycles: number of instruction cycles to simulate
-        startup_delay: seconds before first instruction cycle starts.
-            The CPU's step counter reaches Micro1 at ~13us after power-on.
-            Default 2us means first ROM data appears at ~50us, matching
-            the real CPU timing observed in Load5.raw.
+        startup_delay: seconds before first instruction cycle starts at
+            the *current* clock period (auto-scaled below from the 10us
+            baseline so the relative startup phase stays consistent
+            across frequencies).
+        clock_period_us: target CLK period in microseconds. Default 10us
+            = 100 kHz. The emulator scales every timing constant
+            (ROMCLK_LEAD, RISE_TIME, the startup_delay if at its default
+            value) linearly with this so the PWL bus transitions stay at
+            their original fractions of the clock cycle. Anything
+            time-related that's part of the rom_emulator's contract with
+            the LTspice schematic scales together — the assumption is
+            that the schematic's own PULSE sources are scaled in lockstep
+            by tools/build_and_run_4004.py:patch_clock_pulses.
 
     Returns:
-        dict with keys 'd0in', 'd1in', 'd2in', 'd3in',
-        each mapping to a list of (time, voltage) tuples.
+        (pwl, trace) where pwl is a dict {d0in..d3in -> [(t, V)]} and
+        trace is a list of per-cycle decode tuples.
     """
+    # Scale ratio relative to the 10us baseline used everywhere else.
+    scale = clock_period_us / 10.0
+    clk_period = CLK_PERIOD * scale
+    romclk_lead = ROMCLK_LEAD * scale
+    rise_time = RISE_TIME * scale
+    # Auto-scale startup_delay if the caller left it at the default.
+    # If they passed a non-default value, respect it verbatim.
+    if startup_delay == 2e-6:
+        startup_delay = startup_delay * scale
+
     cpu = CPU4004Sim(rom)
 
     # Track current voltage per line so we can emit proper step transitions
@@ -600,7 +639,7 @@ def generate_pwl(rom: list, num_cycles: int, startup_delay: float = 2e-6,
             v = bit_voltage(nibble, bit)
             if v != current_v[name]:
                 # Hold old value right before transition
-                pwl[name].append((t - RISE_TIME, current_v[name]))
+                pwl[name].append((t - rise_time, current_v[name]))
                 # Step to new value
                 pwl[name].append((t, v))
                 current_v[name] = v
@@ -619,9 +658,9 @@ def generate_pwl(rom: list, num_cycles: int, startup_delay: float = 2e-6,
         opa = b1 & 0xF
 
         # Byte 1: OPR during Micro4, OPA during Micro5
-        t_opr = t + (FETCH_PHASE_OPR * CLK_PERIOD) - ROMCLK_LEAD
-        t_opa = t + (FETCH_PHASE_OPA * CLK_PERIOD) - ROMCLK_LEAD
-        t_clear1 = t + ((FETCH_PHASE_OPA + 1) * CLK_PERIOD) - ROMCLK_LEAD
+        t_opr = t + (FETCH_PHASE_OPR * clk_period) - romclk_lead
+        t_opa = t + (FETCH_PHASE_OPA * clk_period) - romclk_lead
+        t_clear1 = t + ((FETCH_PHASE_OPA + 1) * clk_period) - romclk_lead
 
         set_bus(t_opr, opr)
         set_bus(t_opa, opa)
@@ -631,7 +670,7 @@ def generate_pwl(rom: list, num_cycles: int, startup_delay: float = 2e-6,
             # data bus at X2/X3 with the value the CPU expects to latch
             # into ACC. Skip the bus-clear and present RAM data instead;
             # it holds through to the next instruction's OPR phase.
-            t_ram = t + (RAM_READ_PHASE * CLK_PERIOD) - ROMCLK_LEAD
+            t_ram = t + (RAM_READ_PHASE * clk_period) - romclk_lead
             set_bus(t_ram, ram_read_data)
         else:
             set_bus(t_clear1, 0)  # Clear bus (all low)
@@ -641,15 +680,15 @@ def generate_pwl(rom: list, num_cycles: int, startup_delay: float = 2e-6,
             opr2 = (b2 >> 4) & 0xF
             opa2 = b2 & 0xF
 
-            t_opr2 = t + (FETCH_PHASE_OPR2 * CLK_PERIOD) - ROMCLK_LEAD
-            t_opa2 = t + (FETCH_PHASE_OPA2 * CLK_PERIOD) - ROMCLK_LEAD
-            t_clear2 = t + ((FETCH_PHASE_OPA2 + 1) * CLK_PERIOD) - ROMCLK_LEAD
+            t_opr2 = t + (FETCH_PHASE_OPR2 * clk_period) - romclk_lead
+            t_opa2 = t + (FETCH_PHASE_OPA2 * clk_period) - romclk_lead
+            t_clear2 = t + ((FETCH_PHASE_OPA2 + 1) * clk_period) - romclk_lead
 
             set_bus(t_opr2, opr2)
             set_bus(t_opa2, opa2)
             set_bus(t_clear2, 0)
 
-        t += n_phases * CLK_PERIOD
+        t += n_phases * clk_period
 
     # Add a final hold point at the end
     for bit in range(4):
@@ -697,7 +736,8 @@ def write_pwl_files(pwl: dict, output_dir: str):
 
 def setup_program(cpu_name: str, program_name: str, asm_text: str,
                   num_cycles: int = 20, startup_delay: float = 2e-6,
-                  verbose: bool = False):
+                  verbose: bool = False,
+                  clock_period_us: float = 10.0):
     """Full workflow: create program folder, assemble, generate PWLs, build CPU .asc.
 
     Creates:
@@ -724,7 +764,8 @@ def setup_program(cpu_name: str, program_name: str, asm_text: str,
     print(f"Assembled {len(rom)} bytes: {' '.join(f'{b:02X}' for b in rom)}")
 
     # Generate PWL
-    pwl, trace = generate_pwl(rom, num_cycles, startup_delay)
+    pwl, trace = generate_pwl(rom, num_cycles, startup_delay,
+                              clock_period_us=clock_period_us)
 
     if verbose:
         print(f"\nExecution trace ({len(trace)} cycles):")
@@ -786,6 +827,16 @@ def main():
                         help="Number of instruction cycles to simulate (default: 20)")
     parser.add_argument("--startup-delay", type=float, default=2e-6,
                         help="Seconds before first instruction cycle (default: 2e-6)")
+    parser.add_argument("--clock-period-us", type=float, default=10.0,
+                        help="CLK period in microseconds (default: 10us = "
+                             "100 kHz baseline). All timing constants — "
+                             "ROMCLK_LEAD, RISE_TIME, startup_delay if at "
+                             "default — scale linearly with this. The "
+                             "schematic's own PULSE sources must be scaled "
+                             "in lockstep by patch_clock_pulses.")
+    parser.add_argument("--frequency-hz", type=float, default=None,
+                        help="CLK frequency in Hz (alternative to "
+                             "--clock-period-us). e.g. 1e6 = 1 MHz.")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Print execution trace")
 
@@ -816,8 +867,16 @@ def main():
         with open(asm_path, "r") as f:
             asm_text = f.read()
 
+    # Resolve clock period from either --clock-period-us or --frequency-hz
+    clock_period_us = args.clock_period_us
+    if args.frequency_hz is not None:
+        clock_period_us = 1e6 / args.frequency_hz
+        print(f"Frequency {args.frequency_hz:g} Hz → clock period "
+              f"{clock_period_us:g} us")
+
     setup_program(args.cpu, program_name, asm_text,
-                  args.cycles, args.startup_delay, args.verbose)
+                  args.cycles, args.startup_delay, args.verbose,
+                  clock_period_us=clock_period_us)
 
 
 if __name__ == "__main__":

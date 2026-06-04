@@ -260,6 +260,34 @@ def build(cpu_name: str, output_name: str = None,
     print(f"\n  Output: {output_path}")
 
 
+def append_temperature_directive(asc_path: str, temp_c: float) -> None:
+    """Append an LTspice TEXT block with a `!.temp <T>` SPICE directive
+    to the end of an already-written .asc, so the next transient runs
+    at the requested device temperature.
+
+    Re-running this with a different temperature replaces any previous
+    !.temp directive it added (matched by tag), so successive calls
+    don't accumulate.
+    """
+    tag_marker = "!.temp"  # used to detect/replace prior insertions
+    out_lines = []
+    with open(asc_path) as f:
+        for line in f:
+            # Strip any existing !.temp TEXT we may have appended before
+            if "Left 2 !.temp" in line:
+                continue
+            out_lines.append(line)
+    # LTspice TEXT block placement: just to the right of the .options /
+    # .tran block that lives near (8552, -9472). Stack the !.temp below
+    # everything else we may have added (the .save lines start around
+    # y = -9400 and step down).
+    out_lines.append(
+        f"TEXT 8552 -9400 Left 2 !.temp {temp_c:g}\n"
+    )
+    with open(asc_path, "w") as f:
+        f.writelines(out_lines)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Build combined .asc from CPU project")
     parser.add_argument("cpu", help="CPU project name (folder under cpus/)")
@@ -269,9 +297,22 @@ def main():
                         help="Program binary to analyze for minimal build")
     parser.add_argument("--profile", default=None,
                         help="JSON resource profile (from analyze_program.py --output)")
+    parser.add_argument("--temperature", "-T", type=float, default=None,
+                        help="Operating temperature in Celsius. Inserts a "
+                             "!.temp <value> SPICE directive into the built "
+                             ".asc so LTspice scales the device model "
+                             "accordingly. Used by the Extension B "
+                             "temperature-sweep campaign.")
 
     args = parser.parse_args()
     build(args.cpu, args.output, args.program, args.profile)
+    if args.temperature is not None:
+        # Determine where the .asc actually landed
+        output_path = args.output
+        if output_path is None:
+            output_path = os.path.join(CPUS_DIR, args.cpu, f"{args.cpu}.asc")
+        append_temperature_directive(output_path, args.temperature)
+        print(f"  + appended !.temp {args.temperature:g} directive to {output_path}")
 
 
 if __name__ == "__main__":
